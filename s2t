@@ -1,0 +1,2353 @@
+#!/usr/bin/python3.13
+r"""
+Wrapper für svg2tikz mit automatischer Vorverarbeitung:
+- Konvertiert baseline-shift:sub in Unicode-Subscripts (die dann in LaTeX umgewandelt werden)
+- Berechnet \globalscale aus SVG-Breite so dass Bild in \textwidth passt (nie vergrößern)
+- Entfernt unnötige Leerzeilen in der Ausgabe
+- Kombiniert aufeinanderfolgende Subscripts zu _{mathrm{...}}
+- Automatischer Output-Dateiname: input.svg -> input.tex
+- tikz:anchor-Attribut auf <text>: Überschreibt den berechneten TikZ-Anker direkt.
+  Beispiel: tikz:anchor="south west" pinnt die untere linke Ecke des Textkastens
+  an die SVG-Koordinate, unabhängig von text-anchor/dominant-baseline.
+
+Verwendung: s2t input.svg [--output output.tex] [--textwidth 150] [--textheight N] [svg2tikz Optionen]
+  --textwidth N   Zielbreite in mm (Standard: 150mm)
+  --textheight N  Zielhöhe in mm (optional; kleinerer der beiden Skalierungsfaktoren wird verwendet)
+"""
+
+import sys
+import subprocess
+import re
+import tempfile
+import os
+
+# Unicode subscript mapping (ASCII -> Unicode subscript)
+SUBSCRIPT_MAP = {
+    '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+    '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+    '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎',
+    'a': 'ₐ', 'e': 'ₑ', 'o': 'ₒ', 'x': 'ₓ', 'h': 'ₕ',
+    'k': 'ₖ', 'l': 'ₗ', 'm': 'ₘ', 'n': 'ₙ', 'p': 'ₚ',
+    's': 'ₛ', 't': 'ₜ', 'i': 'ᵢ', 'j': 'ⱼ', 'r': 'ᵣ',
+    'u': 'ᵤ', 'v': 'ᵥ', 'β': 'ᵦ', 'γ': 'ᵧ', 'ρ': 'ᵨ',
+    'φ': 'ᵩ', 'χ': 'ᵪ',
+    'B': 'ᵦ',  # Beta subscript
+    'q': 'ᵩ',  # Phi subscript
+    'C': 'C',  # C hat kein Unicode subscript, bleibt normal
+}
+
+# Reverse mapping NUR für die Unicode-Subscript-Zeichen
+LATEX_SUBSCRIPT_MAP = {
+    '₀': '_0', '₁': '_1', '₂': '_2', '₃': '_3', '₄': '_4',
+    '₅': '_5', '₆': '_6', '₇': '_7', '₈': '_8', '₉': '_9',
+    '₊': '_+', '₋': '_-', '₌': '_=', '₍': '_(', '₎': '_)',
+    'ₐ': '_a', 'ₑ': '_e', 'ₒ': '_o', 'ₓ': '_x', 'ₕ': '_h',
+    'ₖ': '_k', 'ₗ': '_l', 'ₘ': '_m', 'ₙ': '_n', 'ₚ': '_p',
+    'ₛ': '_s', 'ₜ': '_t', 'ᵢ': '_i', 'ⱼ': '_j', 'ᵣ': '_r',
+    'ᵤ': '_u', 'ᵥ': '_v', 'ᵦ': '_B', 'ᵧ': '_g', 'ᵨ': '_r',
+    'ᵩ': '_q', 'ᵪ': '_c',
+}
+
+
+# Mapping: (text-anchor, dominant-baseline) -> TikZ anchor
+# text-anchor:      start | middle | end
+# dominant-baseline: auto | alphabetic | hanging | middle | central | text-top | text-bottom
+#
+# TikZ-Anker-Schema:
+#   vertikal:   north (oben), base (Grundlinie), mid (Mitte x-Höhe), center (geometrisch), south (unten)
+#   horizontal: west (links), (leer = zentriert), east (rechts)
+TIKZ_ANCHOR_MAP = {
+    # (text-anchor,  dominant-baseline)  : tikz-anchor
+    ('start',  'auto'):        'base west',
+    ('start',  'alphabetic'):  'base west',
+    ('start',  'hanging'):     'north west',
+    ('start',  'middle'):      'mid west',
+    ('start',  'central'):     'west',
+    ('start',  'text-top'):    'north west',
+    ('start',  'text-bottom'): 'south west',
+
+    ('middle', 'auto'):        'base',
+    ('middle', 'alphabetic'):  'base',
+    ('middle', 'hanging'):     'north',
+    ('middle', 'middle'):      'mid',
+    ('middle', 'central'):     'center',
+    ('middle', 'text-top'):    'north',
+    ('middle', 'text-bottom'): 'south',
+
+    ('end',    'auto'):        'base east',
+    ('end',    'alphabetic'):  'base east',
+    ('end',    'hanging'):     'north east',
+    ('end',    'middle'):      'mid east',
+    ('end',    'central'):     'east',
+    ('end',    'text-top'):    'north east',
+    ('end',    'text-bottom'): 'south east',
+}
+
+# Marker-Attribut, das temporär in die SVG geschrieben wird
+_TIKZ_ANCHOR_ATTR = 'data-tikz-anchor'
+
+# Marker inserted between a subscript tspan and its tail text,
+# so that trailing characters (e.g. prime ') are NOT pulled into the subscript group.
+_TAIL_MARKER = '⌿'
+
+# Markers wrapping text that must stay upright (\mathrm) inside math mode,
+# because the tspan explicitly resets font-style:normal inside an italic ancestor.
+_UPRIGHT_START = '⟦'
+_UPRIGHT_END   = '⟧'
+
+
+def svg_style_to_tikz_anchor(style_str):
+    """
+    Liest text-anchor und dominant-baseline aus einem style-String
+    und gibt den entsprechenden TikZ-Anker zurück, oder None wenn
+    keine relevanten Eigenschaften gesetzt sind.
+    """
+    props = {}
+    for decl in style_str.split(';'):
+        if ':' in decl:
+            p, _, v = decl.partition(':')
+            props[p.strip()] = v.strip()
+
+    ta  = props.get('text-anchor', 'start').strip()
+    db  = props.get('dominant-baseline', 'auto').strip()
+
+    # Normalisierung von Aliasen
+    if db in ('baseline', ''):
+        db = 'auto'
+
+    return TIKZ_ANCHOR_MAP.get((ta, db))
+
+
+def text_to_subscript(text):
+    """Konvertiert Text in Unicode-Subscript, oder markiert mit ⎵ wenn kein Unicode existiert."""
+    result = []
+    for char in text:
+        mapped = SUBSCRIPT_MAP.get(char)
+        if mapped and mapped != char:
+            result.append(mapped)
+        else:
+            result.append('⎵' + char)
+    return ''.join(result)
+
+
+def parse_css_rules(css_text):
+    """
+    Parst einen CSS-Block und gibt eine Liste von (selector, {prop: value}) zurück.
+    Unterstützt einfache Selektoren: Elementnamen (text, tspan), Klassen (.foo),
+    und Element+Klasse-Kombinationen (text.foo).
+    """
+    rules = []
+    # Kommentare entfernen
+    css_text = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
+    for block in re.finditer(r'([^{]+)\{([^}]*)\}', css_text):
+        selectors_raw = block.group(1).strip()
+        declarations = block.group(2).strip()
+        props = {}
+        for decl in declarations.split(';'):
+            if ':' in decl:
+                prop, _, val = decl.partition(':')
+                props[prop.strip()] = val.strip()
+        if props:
+            for sel in selectors_raw.split(','):
+                rules.append((sel.strip(), props))
+    return rules
+
+
+def matches_selector(element, selector, ns):
+    """Prüft ob ein lxml-Element einen einfachen CSS-Selektor erfüllt."""
+    tag_local = element.tag.replace(f'{{{ns}}}', '') if element.tag.startswith('{') else element.tag
+    classes = set(element.get('class', '').split())
+
+    # z.B. "text.myclass" oder ".myclass" oder "text"
+    m = re.fullmatch(r'([a-zA-Z][\w-]*)?(\.[\w-]+)*', selector)
+    if not m:
+        return False
+    tag_part = m.group(1) or ''
+    class_parts = set(c.lstrip('.') for c in re.findall(r'\.\w[\w-]*', selector))
+
+    if tag_part and tag_local != tag_part:
+        return False
+    if class_parts and not class_parts.issubset(classes):
+        return False
+    return True
+
+
+def hex_to_rgb_style(style_str):
+    """
+    Ersetzt #rrggbb Hex-Farben in einem style-String durch rgb(r,g,b),
+    damit svg2tikz sie als \\definecolor{...}{rgb}{...} ausgibt anstatt
+    sie auf einen (möglicherweise falschen) benannten xcolor-Namen abzubilden.
+    Sichere Grundfarben (schwarz, weiß, primäre RGB/CMY) bleiben als Hex,
+    da svg2tikz sie korrekt auf black/white/red/green/blue/... abbildet.
+    """
+    # Farben die svg2tikz korrekt als benannte TikZ-Farbe ausgibt
+    SAFE_HEX = {
+        '#000000',  # black
+        '#ffffff',  # white
+        '#ff0000',  # red
+        '#00ff00',  # lime  (TikZ: green)
+        '#0000ff',  # blue
+        '#ffff00',  # yellow
+        '#00ffff',  # cyan
+        '#ff00ff',  # magenta
+    }
+    def replace_hex(m):
+        h = m.group(0).lower()
+        if h in SAFE_HEX:
+            return m.group(0)
+        r = int(h[1:3], 16)
+        g = int(h[3:5], 16)
+        b = int(h[5:7], 16)
+        return f'rgb({r},{g},{b})'
+    return re.sub(r'#[0-9a-fA-F]{6}', replace_hex, style_str)
+
+
+def apply_css_to_element(element, rules, ns):
+    """
+    Wendet passende CSS-Regeln auf ein Element an,
+    indem fehlende Eigenschaften als style-Attribut gesetzt werden.
+    Direkte style-Attribute haben Vorrang (Spezifität ignoriert).
+    """
+    # Bestehende inline-styles parsen
+    existing = {}
+    for decl in element.get('style', '').split(';'):
+        if ':' in decl:
+            p, _, v = decl.partition(':')
+            existing[p.strip()] = v.strip()
+
+    # CSS-Regeln der Reihe nach anwenden (später = höhere Priorität,
+    # aber inline style schlägt immer)
+    merged = {}
+    for selector, props in rules:
+        if matches_selector(element, selector, ns):
+            merged.update(props)
+
+    # Inline-Style überschreibt CSS
+    merged.update(existing)
+
+    if merged:
+        style_str = '; '.join(f'{p}: {v}' for p, v in merged.items())
+        element.set('style', hex_to_rgb_style(style_str))
+
+
+def _split_powerclip_subpaths(d):
+    """Teilt einen SVG-Pfad-d-String an Top-Level-M/m-Kommandos in Subpfade
+    und gibt eine Liste von (absX, absY, rest)-Tupeln zurück. `rest` ist der
+    Subpfad AB dem ersten Kommando NACH dem (ggf. relativen) moveto.
+
+    Hintergrund: Subpfade in SVG-Pfad-Daten können mit lowercase `m` beginnen
+    – das ist eine *relative* Bewegung zum Ende des vorherigen Subpfads
+    (nach dessen `z`-Close also dessen eigener Anfangspunkt). Beim Heraus-
+    lösen einzelner Subpfade müssen die ersten Positionen in absolute
+    Koordinaten aufgelöst werden.
+    """
+    parts = re.split(r'(?=[Mm])', d.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+
+    result = []
+    prev_start_abs = (0.0, 0.0)
+    for p in parts:
+        m = re.match(r'([Mm])\s*(-?[\d.]+)\s*[,\s]\s*(-?[\d.]+)\s*(.*)',
+                     p, flags=re.DOTALL)
+        if not m:
+            result.append((prev_start_abs[0], prev_start_abs[1], p))
+            continue
+        cmd, x_str, y_str, rest = m.groups()
+        x, y = float(x_str), float(y_str)
+        if cmd == 'M':
+            abs_x, abs_y = x, y
+        else:
+            abs_x = prev_start_abs[0] + x
+            abs_y = prev_start_abs[1] + y
+        result.append((abs_x, abs_y, rest.strip()))
+        prev_start_abs = (abs_x, abs_y)
+    return result
+
+
+def _apply_inkscape_path_differences(tree, root, jobs, ns):
+    """Delegiert die Bool'sche Differenzbildung an Inkscape.
+
+    Schreibt den aktuellen Tree in eine temporäre SVG-Datei, ruft
+    Inkscape mit einer Action-Liste auf, die für jedes (target_id,
+    hole_id)-Paar select-by-id + path-difference ausführt, liest den
+    modifizierten SVG wieder ein und gibt das neue Root-Element zurück.
+
+    Voraussetzung: `inkscape` im PATH (1.2 oder neuer für die hier
+    verwendete Action-Syntax). Ist Inkscape nicht verfügbar oder scheitert
+    der Aufruf, geben wir eine Warnung auf stderr aus und lassen den Tree
+    unverändert – das Powerclip-Ziel wird dann von svg2tikz ohne Cutout
+    gezeichnet (besser als gar keine Ausgabe).
+    """
+    from lxml import etree
+    import subprocess
+    import tempfile
+    import shutil
+    import os
+    import sys
+
+    if not shutil.which('inkscape'):
+        print('s2t: warning: `inkscape` nicht gefunden – Powerclip-Cutouts '
+              'bleiben ungeändert (es entsteht dann kein Loch im Element). '
+              'Inkscape installieren, um saubere Cutouts zu erhalten.',
+              file=sys.stderr)
+        return tree, root
+
+    # Aktionsliste für Inkscape zusammenbauen. Pro Job:
+    #   select-by-id:target,hole;path-difference;
+    # Inkscape zieht dabei das obere Objekt vom unteren ab. Wir haben das
+    # Loch direkt nach dem Ziel eingefügt → Loch ist oben (höherer
+    # z-Index in SVG-Doc-Order) → target \\ hole ist das Ergebnis.
+    actions = []
+    for target_id, hole_id in jobs:
+        actions.append(f'select-by-id:{target_id},{hole_id}')
+        actions.append('path-difference')
+        actions.append('select-clear')
+    actions.append('export-filename:{out}')
+    actions.append('export-overwrite')
+    actions.append('export-do')
+    # Platzhalter für export-filename wird unten ersetzt
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_svg  = os.path.join(tmpdir, 'in.svg')
+        out_svg = os.path.join(tmpdir, 'out.svg')
+        tree.write(in_svg, encoding='utf-8', xml_declaration=True)
+
+        action_list = ';'.join(a.format(out=out_svg) for a in actions)
+
+        cmd = [
+            'inkscape',
+            in_svg,
+            '--export-plain-svg',
+            '--export-type=svg',
+            f'--actions={action_list}',
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=60, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f's2t: warning: Inkscape path-difference fehlgeschlagen '
+                  f'(Exit {e.returncode}). stderr:\n{e.stderr}',
+                  file=sys.stderr)
+            return tree, root
+        except subprocess.TimeoutExpired:
+            print('s2t: warning: Inkscape-Aufruf hat Timeout erreicht.',
+                  file=sys.stderr)
+            return tree, root
+
+        if not os.path.exists(out_svg):
+            print('s2t: warning: Inkscape hat keine Ausgabedatei erzeugt.',
+                  file=sys.stderr)
+            return tree, root
+
+        try:
+            parser = etree.XMLParser(remove_blank_text=False)
+            new_tree = etree.parse(out_svg, parser)
+            new_root = new_tree.getroot()
+        except etree.XMLSyntaxError as e:
+            print(f's2t: warning: Inkscape-Ausgabe nicht parsebar: {e}',
+                  file=sys.stderr)
+            return tree, root
+
+    # Tree „umhängen": Wir können die externe Struktur nicht in-place
+    # aktualisieren, aber der Aufrufer kann mit dem neuen Tree
+    # weiterarbeiten, indem er den alten verwirft.
+    return new_tree, new_root
+
+
+def process_svg(input_file):
+    """Pre-processing pipeline: transforms the SVG before passing it to svg2tikz.
+
+    Applied in order:
+    1.  Strip unknown namespace prefixes (beamer:, tikz:) so lxml can parse.
+    2.  Extract user-defined beamer:overlay values and tikz:anchor values into plain attrs.
+    3.  Flatten CSS <style> blocks onto text/tspan inline style= attributes.
+    4.  Compute TikZ anchor (from text-anchor + dominant-baseline, or tikz:anchor
+        override) and store as data-tikz-anchor on each <text> element.
+    5.  Convert baseline-shift:sub tspans → Unicode subscripts (or ł-passthrough
+        for mixed italic/upright subscripts).
+    6.  Mark upright tspans inside italic ancestors with ⟦...⟧ markers.
+    7.  Measure SVG content bounding box (including elements outside viewport)
+        for globalscale computation.
+    8.  Build anchor_map, align_map, font_map, stroke_map per element ID.
+    9.  Inject beamer sentinel nodes for group overlay handling.
+    10. Merge multiline tspans (different y values) with ⏎ line-break markers.
+    11. Promote tspan fill colour to parent <text> where svg2tikz ignores it.
+    12. Save text stroke as data-attributes for post-processing.
+    13. Resolve Inkscape Powerclip (inverse clip-path) via Inkscape path-difference.
+    14. Convert all remaining hex colours to rgb() form.
+    15. Strip internal data-attributes before svg2tikz sees the SVG.
+
+    Returns: (svg_string, width_px, height_px, default_anchor, anchor_map,
+              beamer_overlay_map, stroke_map, font_map, keep_font_ids, align_map)
+    """
+    from lxml import etree
+
+    # beamer:overlay-Attribute VOR dem lxml-Parse aus dem Rohtext extrahieren
+    # und entfernen. lxml lehnt SVGs ab, die einen unbekannten Namespace-Präfix
+    # (z.B. "beamer") ohne zugehörige xmlns-Deklaration verwenden.
+    #
+    # Inkscape schreibt das Attribut als  beamer:overlay="<spec>"  (oder mit
+    # HTML-Entity &lt;...&gt;) direkt auf SVG-Elemente. Wir lesen id + overlay-Wert
+    # per Regex aus dem Rohtext, decodieren HTML-Entities und entfernen das Attribut.
+    with open(input_file, 'r', encoding='utf-8') as _f:
+        raw_svg = _f.read()
+
+    beamer_overlay_map = {}  # { element_id: overlay_string }
+
+    # Schritt 1: Alle Namespace-Deklarationen für "beamer" und "tikz" entfernen
+    raw_svg = re.sub(r'\s+xmlns:beamer\s*=\s*"[^"]*"', '', raw_svg)
+    raw_svg = re.sub(r"\s+xmlns:beamer\s*=\s*'[^']*'", '', raw_svg)
+    raw_svg = re.sub(r'\s+xmlns:tikz\s*=\s*"[^"]*"', '', raw_svg)
+    raw_svg = re.sub(r"\s+xmlns:tikz\s*=\s*'[^']*'", '', raw_svg)
+
+    # tikz:anchor="..." → data-tikz-anchor-user="..." (lxml versteht keinen
+    # unbekannten Namespace-Präfix ohne Deklaration; wir retten den Wert als
+    # plain data-Attribut und lesen ihn später in process_svg aus).
+    raw_svg = re.sub(r'\btikz:anchor\s*=\s*"([^"]*)"',
+                     r'data-tikz-anchor-user="\1"', raw_svg)
+    raw_svg = re.sub(r"\btikz:anchor\s*=\s*'([^']*)'",
+                     r"data-tikz-anchor-user='\1'", raw_svg)
+
+    # Schritt 2: beamer:overlay-Attribute extrahieren und aus dem XML entfernen.
+    def _html_unescape(s):
+        return (s.replace('&lt;', '<').replace('&gt;', '>')
+                 .replace('&amp;', '&').replace('&quot;', '"').replace('&#39;', "'"))
+
+    def _extract_beamer(m):
+        """Entfernt beamer:overlay aus einem Tag-String und merkt id+spec."""
+        tag_text = m.group(0)
+        ov_m = re.search(r'beamer:overlay\s*=\s*"([^"]*)"', tag_text)
+        if not ov_m:
+            ov_m = re.search(r"beamer:overlay\s*=\s*'([^']*)'", tag_text)
+        if not ov_m:
+            return tag_text
+        overlay_raw = _html_unescape(ov_m.group(1).strip())
+        id_m = re.search(r'\bid\s*=\s*"([^"]*)"', tag_text)
+        if not id_m:
+            id_m = re.search(r"\bid\s*=\s*'([^']*)'", tag_text)
+        if id_m and overlay_raw:
+            el_id = id_m.group(1)
+            spec = overlay_raw if overlay_raw.startswith('<') else '<' + overlay_raw + '>'
+            beamer_overlay_map[el_id] = spec
+        tag_text = re.sub(r'\s+beamer:overlay\s*=\s*"[^"]*"', '', tag_text)
+        tag_text = re.sub(r"\s+beamer:overlay\s*=\s*'[^']*'", '', tag_text)
+        return tag_text
+
+    raw_svg = re.sub(r'<[A-Za-z][^>]*beamer:overlay[^>]*>', _extract_beamer, raw_svg)
+
+    import io
+    parser = etree.XMLParser(remove_blank_text=False)
+    tree = etree.parse(io.BytesIO(raw_svg.encode('utf-8')), parser)
+    root = tree.getroot()
+    ns = 'http://www.w3.org/2000/svg'
+
+    # CSS aus <style>-Blöcken sammeln und auf text/tspan-Elemente anwenden
+    css_rules = []
+    for style_el in root.iter(f'{{{ns}}}style'):
+        if style_el.text:
+            css_rules.extend(parse_css_rules(style_el.text))
+
+    # Auch style-Attribut am <svg>-Root-Element auswerten
+    # (z.B. style="text { text-anchor:end; dominant-baseline:middle; }")
+    root_style = root.get('style', '')
+    if '{' in root_style:
+        css_rules.extend(parse_css_rules(root_style))
+        # Style-Attribut vom Root entfernen, damit svg2tikz es nicht falsch interpretiert
+        root.attrib.pop('style', None)
+
+    if css_rules:
+        for el in list(root.iter(f'{{{ns}}}text')) + list(root.iter(f'{{{ns}}}tspan')):
+            apply_css_to_element(el, css_rules, ns)
+
+    # Gewünschten TikZ-Anker als Marker-Attribut auf jedes <text>-Element schreiben,
+    # damit fix_latex_output ihn nach der Konvertierung korrekt einsetzen kann.
+    #
+    # Priorität:
+    # 1. tikz:anchor-Attribut (explizit vom Nutzer gesetzt, überschreibt alles)
+    # 2. Berechnet aus text-anchor + dominant-baseline im style-Attribut
+    #
+    # tikz:anchor wird in Inkscape im XML-Editor gesetzt:
+    #   Attributname:  tikz:anchor   (Namespace-Präfix tikz)
+    #   Attributwert:  z.B. south west, north east, center, ...
+    # Inkscape braucht dafür eine xmlns:tikz-Deklaration im <svg>-Root-Element,
+    # die s2t beim Einlesen ignoriert (unbekannte Namespaces werden entfernt).
+    # Deshalb wird tikz:anchor als reines Attribut ohne Namespace-Prüfung gelesen.
+    _TIKZ_ANCHOR_USER_ATTR = 'data-tikz-anchor-user'  # gesetzt von Regex-Vorverarbeitung
+
+    for el in root.iter(f'{{{ns}}}text'):
+        # Explizites tikz:anchor-Attribut hat höchste Priorität
+        user_anchor = el.get(_TIKZ_ANCHOR_USER_ATTR, '').strip()
+        if user_anchor:
+            el.set(_TIKZ_ANCHOR_ATTR, user_anchor)
+        else:
+            anchor = svg_style_to_tikz_anchor(el.get('style', ''))
+            if anchor:
+                el.set(_TIKZ_ANCHOR_ATTR, anchor)
+
+    def get_style_prop(el, prop):
+        """Liest eine einzelne CSS-Eigenschaft aus dem style-Attribut."""
+        for decl in el.get('style', '').split(';'):
+            if ':' in decl:
+                p, _, v = decl.partition(':')
+                if p.strip() == prop:
+                    return v.strip()
+        return None
+
+    # Subscript-tspans konvertieren
+    # Nur tspans mit baseline-shift:sub (nicht baseline, 0, super, ...)
+    # Zuerst alle relevanten tspans sammeln (nicht im laufenden Iterator modifizieren!)
+    sub_tspans = [
+        tspan for tspan in root.iter(f'{{{ns}}}tspan')
+        if re.search(r'baseline-shift\s*:\s*sub\b', tspan.get('style', ''))
+    ]
+    for tspan in sub_tspans:
+        style = tspan.get('style', '')
+
+        # baseline-shift aus Style entfernen
+        new_style = re.sub(r'baseline-shift:[^;]+;?', '', style)
+        tspan.set('style', new_style)
+
+        children = list(tspan)
+
+        def is_italic_tspan(child):
+            fs = get_style_prop(child, 'font-style')
+            return fs in ('italic', 'oblique')
+
+        if not children:
+            # Einfacher Fall: kein Kind-tspan, Text direkt im tspan
+            if tspan.text:
+                tspan.text = text_to_subscript(tspan.text)
+        else:
+            # Komplexer Fall: tspan enthält Kind-tspans (gemischte Kursiv/Aufrecht-Indizes).
+            # Wir konstruieren direkt den fertigen LaTeX-Ausdruck und schreiben ihn als
+            # ł-Passthrough in den ersten tspan des übergeordneten <text>-Elements.
+            # Alle anderen tspans im <text> werden dann geleert.
+            #
+            # Strategie für den Subscript-Inhalt:
+            #   - Kind-tspan mit font-style:italic → kursiv im Index (kein \mathrm)
+            #   - Tail-Text des italic-Kindes → aufrecht (\mathrm{...})
+
+            # Subscript-Inhalt zusammensetzen
+            sub_italic = ''
+            sub_upright = ''
+
+            if tspan.text and tspan.text.strip():
+                sub_upright += tspan.text  # direkter Text vor Kindern → aufrecht
+
+            for child in children:
+                child_text = child.text or ''
+                child_tail = child.tail or ''
+                if is_italic_tspan(child):
+                    sub_italic += child_text
+                    # Tail nach einem italic Kind gehört zum aufrechten Rest
+                    sub_upright += child_tail
+                else:
+                    sub_upright += child_text + child_tail
+
+            # LaTeX für den Index aufbauen:
+            # kursive Teile direkt (math-mode = kursiv per Default),
+            # aufrechte Teile mit \mathrm{...}
+            if sub_italic and sub_upright:
+                sub_latex = sub_italic + r'\mathrm{' + sub_upright + '}'
+            elif sub_italic:
+                sub_latex = sub_italic
+            else:
+                sub_latex = r'\mathrm{' + sub_upright + '}'
+
+            # Basiszeichen (kursiv) aus dem Geschwister-tspan oder tspan.text des Elterns suchen.
+            # Der <text>-Node hat typischerweise die Struktur:
+            #   <tspan (role=line)>
+            #     <tspan italic>BUCHSTABE</tspan>       ← Basiszeichen
+            #     <tspan baseline-shift:sub>...</tspan> ← unser tspan
+            #   </tspan>
+            # Wir suchen im direkten Eltern-tspan nach dem Vorgänger.
+            parent = tspan.getparent()
+            base_char = ''
+            if parent is not None:
+                siblings = list(parent)
+                idx = siblings.index(tspan)
+                if idx > 0:
+                    prev = siblings[idx - 1]
+                    fs = get_style_prop(prev, 'font-style')
+                    if fs in ('italic', 'oblique') and prev.text:
+                        base_char = prev.text
+                        prev.text = ''   # Basiszeichen aus dem Geschwister entfernen
+                # Auch direkten Text im Eltern-tspan berücksichtigen
+                if parent.text and parent.text.strip():
+                    base_char = parent.text + base_char
+                    parent.text = ''
+
+            full_latex = r'\(' + base_char + '_{' + sub_latex + r'}' + r'\)'
+
+            # ł-Passthrough: Den fertigen LaTeX-Ausdruck in den ersten tspan des
+            # <text>-Elements schreiben. Der ł-Marker zeigt fix_latex_output an,
+            # dass dieser Inhalt unverändert (nach Entescapen) durchgereicht werden soll.
+            text_el = tspan.getparent()
+            while text_el is not None and not text_el.tag.endswith('}text'):
+                text_el = text_el.getparent()
+
+            if text_el is not None:
+                # Ersten tspan im text-Element finden
+                first_tspan = text_el.find(f'{{{ns}}}tspan')
+                if first_tspan is not None:
+                    # Alle tspans im text-Element leeren
+                    for ts in list(text_el.iter(f'{{{ns}}}tspan')):
+                        ts.text = None
+                        ts.tail = None
+                    # ł + LaTeX in den ersten tspan
+                    first_tspan.text = 'ł' + full_latex
+                else:
+                    # Fallback: direkt in tspan schreiben
+                    for child in children:
+                        tspan.remove(child)
+                    tspan.text = 'ł' + full_latex
+            else:
+                # Kein text-Element gefunden – Kinder entfernen, Passthrough in tspan
+                for child in children:
+                    tspan.remove(child)
+                tspan.text = 'ł' + full_latex
+
+            # baseline-shift bereits entfernt, tail-Marker nicht nötig (Passthrough übernimmt alles)
+            continue  # kein weiteres tail-Processing
+
+        # If there is tail text (normal-baseline text right after the closing
+        # </tspan>), prefix it with _TAIL_MARKER so fix_latex_output knows
+        # to end the subscript group before this text.
+        if tspan.tail and tspan.tail.strip():
+            tspan.tail = _TAIL_MARKER + tspan.tail
+
+    # Upright-tspans markieren: tspan mit font-style:normal innerhalb eines
+    # italic-Vorfahren. svg2tikz fasst alles zu einem String zusammen; ohne
+    # Markierung wird der Text im erzeugten \(...\) kursiv dargestellt.
+    def has_italic_ancestor(el):
+        """Prüft ob ein Vorfahren-Element font-style:italic gesetzt hat."""
+        parent = el.getparent()
+        while parent is not None:
+            fs = get_style_prop(parent, 'font-style')
+            if fs == 'italic' or fs == 'oblique':
+                return True
+            parent = parent.getparent()
+        return False
+
+    for tspan in root.iter(f'{{{ns}}}tspan'):
+        style = tspan.get('style', '')
+        # Nur tspans die explizit font-style:normal setzen
+        if get_style_prop(tspan, 'font-style') != 'normal':
+            continue
+        # Nur wenn ein Vorfahre italic ist
+        if not has_italic_ancestor(tspan):
+            continue
+        # Nur den Text des tspan selbst mit Upright-Markern umschließen.
+        # tspan.tail ist Text NACH dem schließenden </tspan>-Tag – er gehört
+        # zum Eltern-Element und erbt dessen Stil (nicht den des tspan).
+        # Tail-Text darf daher NICHT als upright markiert werden.
+        if tspan.text and tspan.text.strip():
+            tspan.text = _UPRIGHT_START + tspan.text + _UPRIGHT_END
+
+    # SVG-Breite und -Höhe ermitteln (in px) — zwei Werte pro Dimension:
+    #
+    # 1. viewport_w/h: aus dem width/height-Attribut bzw. viewBox.
+    #    Wird als Fallback verwendet und für die Statusausgabe.
+    #
+    # 2. content_w/h: tatsächliche Ausdehnung des gerenderten Inhalts
+    #    (alle Elemente mit ihren Transformationen). svg2tikz clippt NICHT
+    #    auf den SVG-Viewport – Elemente die über width/height hinausragen
+    #    werden trotzdem ausgegeben. Für globalscale ist daher content_w/h
+    #    die korrekte Grundlage.
+    unit_to_px = {'mm': 3.7795275591, 'cm': 37.795275591,
+                  'in': 96.0, 'pt': 1.3333333, 'px': 1.0, '': 1.0}
+
+    viewport_w = None
+    viewport_h = None
+
+    raw_w = root.get('width', '')
+    num = re.sub(r'[^\d.]', '', raw_w)
+    unit = re.sub(r'[\d.\s]', '', raw_w).lower()
+    if num and unit in unit_to_px and unit != '':
+        viewport_w = float(num) * unit_to_px[unit]
+
+    raw_h = root.get('height', '')
+    numh = re.sub(r'[^\d.]', '', raw_h)
+    unith = re.sub(r'[\d.\s]', '', raw_h).lower()
+    if numh and unith in unit_to_px and unith != '':
+        viewport_h = float(numh) * unit_to_px[unith]
+
+    if viewport_w is None or viewport_h is None:
+        viewbox = root.get('viewBox')
+        if viewbox:
+            parts = viewbox.strip().split()
+            if len(parts) == 4:
+                try:
+                    if viewport_w is None:
+                        viewport_w = float(parts[2])
+                    if viewport_h is None:
+                        viewport_h = float(parts[3])
+                except ValueError:
+                    pass
+
+    if viewport_w is None and num:
+        viewport_w = float(num) * unit_to_px.get(unit, 1.0)
+    if viewport_h is None and numh:
+        viewport_h = float(numh) * unit_to_px.get(unith, 1.0)
+
+    # Content-Bounding-Box berechnen: alle Elemente mit ihren kumulierten
+    # Transformationen. Nur Text- und Rect-Positionen werden ausgewertet
+    # (Pfade haben komplexe Bezier-Kurven; deren Extrema genau zu berechnen
+    # wäre aufwendig und für die Skalierungsschätzung nicht nötig).
+    # Für Pfade wird nur der Startpunkt (M-Kommando) erfasst.
+    import math as _math
+
+    def _parse_transform_matrix(t):
+        if not t:
+            return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        m = re.match(
+            r'matrix\s*\(\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,'
+            r'\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)\s*,'
+            r'\s*([-\d.eE+]+)\s*,\s*([-\d.eE+]+)', t)
+        if m:
+            return tuple(float(x) for x in m.groups())
+        m = re.match(r'translate\s*\(\s*([-\d.eE+]+)[,\s]\s*([-\d.eE+]+)', t)
+        if m:
+            return (1.0, 0.0, 0.0, 1.0, float(m.group(1)), float(m.group(2)))
+        m = re.match(r'translate\s*\(\s*([-\d.eE+]+)\s*\)', t)
+        if m:
+            return (1.0, 0.0, 0.0, 1.0, float(m.group(1)), 0.0)
+        m = re.match(r'scale\s*\(\s*([-\d.eE+]+)\s*\)', t)
+        if m:
+            s = float(m.group(1))
+            return (s, 0.0, 0.0, s, 0.0, 0.0)
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    def _compose(o, i):
+        a1,b1,c1,d1,tx1,ty1 = o
+        a2,b2,c2,d2,tx2,ty2 = i
+        return (a1*a2+c1*b2, b1*a2+d1*b2,
+                a1*c2+c1*d2, b1*c2+d1*d2,
+                a1*tx2+c1*ty2+tx1, b1*tx2+d1*ty2+ty1)
+
+    def _apply(m, x, y):
+        a,b,c,d,tx,ty = m
+        return (a*x + c*y + tx, b*x + d*y + ty)
+
+    _bbox_pts = []
+
+    def _collect_bbox(el, ctm=(1.0,0.0,0.0,1.0,0.0,0.0)):
+        local = _parse_transform_matrix(el.get('transform', ''))
+        ctm2  = _compose(ctm, local)
+        tag   = etree.QName(el).localname
+
+        if tag in ('text', 'tspan'):
+            try:
+                x = float(el.get('x', 'nan'))
+                y = float(el.get('y', 'nan'))
+                if _math.isfinite(x) and _math.isfinite(y):
+                    _bbox_pts.append(_apply(ctm2, x, y))
+            except ValueError:
+                pass
+
+        elif tag == 'rect':
+            try:
+                x = float(el.get('x', 0))
+                y = float(el.get('y', 0))
+                w = float(el.get('width', 0))
+                h = float(el.get('height', 0))
+                for px, py in [(x,y),(x+w,y),(x,y+h),(x+w,y+h)]:
+                    _bbox_pts.append(_apply(ctm2, px, py))
+            except ValueError:
+                pass
+
+        elif tag in ('line', 'polyline', 'polygon'):
+            pts_str = el.get('points', '') or \
+                      f"{el.get('x1','')},{el.get('y1','')} {el.get('x2','')},{el.get('y2','')}"
+            for pair in re.findall(r'([-\d.eE+]+)[,\s]+([-\d.eE+]+)', pts_str):
+                try:
+                    _bbox_pts.append(_apply(ctm2, float(pair[0]), float(pair[1])))
+                except ValueError:
+                    pass
+
+        elif tag == 'path':
+            # Nur M-Kommandos (Startpunkte) erfassen
+            d = el.get('d', '')
+            for pm in re.finditer(r'[Mm]\s*([-\d.eE+]+)[,\s]+([-\d.eE+]+)', d):
+                try:
+                    _bbox_pts.append(_apply(ctm2, float(pm.group(1)), float(pm.group(2))))
+                except ValueError:
+                    pass
+
+        for child in el:
+            _collect_bbox(child, ctm2)
+
+    _collect_bbox(root)
+
+    if _bbox_pts:
+        _xs = [p[0] for p in _bbox_pts]
+        _ys = [p[1] for p in _bbox_pts]
+        content_w = max(_xs) - min(_xs)
+        content_h = max(_ys) - min(_ys)
+    else:
+        content_w = viewport_w
+        content_h = viewport_h
+
+    # Für globalscale: content-Größe verwenden (erfasst Elemente außerhalb Viewport).
+    # Fallback auf viewport falls content-Bbox leer oder kleiner als viewport.
+    width_px  = max(content_w, viewport_w) if (content_w and viewport_w) else (content_w or viewport_w)
+    height_px = max(content_h, viewport_h) if (content_h and viewport_h) else (content_h or viewport_h)
+
+    # Standard-Anker aus globalem CSS ermitteln (für fix_latex_output)
+    default_anchor = None
+    for selector, props in css_rules:
+        if selector in ('text', 'tspan', '*'):
+            ta = props.get('text-anchor', '').strip()
+            db = props.get('dominant-baseline', '').strip()
+            if ta or db:
+                default_anchor = TIKZ_ANCHOR_MAP.get(
+                    (ta or 'start', db or 'auto')
+                )
+
+    # Anker-Mapping pro Text-Element-ID aufbauen:
+    # { element_id: tikz_anchor_string }
+    anchor_map = {}
+    stroke_map = {}  # { element_id: (color_str, width_str) }
+    # keep_font_map: { element_id: tikz_font_spec_string }
+    # Gebaut für alle <text>-Elemente mit class="s2t-keep-font".
+    # Der font-spec-String enthält \fontspec{Name}\fontsize{Xpt}{Ypt}\selectfont
+    # plus optionale \bfseries / \itshape, abgeleitet aus den SVG-Style-Attributen.
+    keep_font_map = {}
+    PX_TO_PT = 0.75  # 1px = 0.75pt bei 96 dpi
+
+    def _svg_style_to_tikz_font(style_str):
+        """Liest font-* Eigenschaften aus einem SVG-Style-String und gibt
+        ein Dict mit den Komponenten zurück (family_cmd, pt, weight_cmd, shape_cmd).
+        pt ist die unkalkulierte Punktgröße (noch ohne globalscale-Faktor)."""
+        props = {}
+        for decl in style_str.split(';'):
+            if ':' in decl:
+                p, _, v = decl.partition(':')
+                props[p.strip().lower()] = v.strip()
+
+        # --- Schriftfamilie ---
+        family_raw = props.get('font-family', '')
+        family = family_raw.split(',')[0].strip().strip('"\'')
+        _generic = {
+            'serif':      r'\rmfamily',
+            'sans-serif': r'\sffamily',
+            'monospace':  r'\ttfamily',
+            'cursive':    r'\itshape',
+            'fantasy':    r'\rmfamily',
+        }
+        if family.lower() in _generic:
+            family_cmd = _generic[family.lower()]
+        elif family:
+            family_cmd = r'\fontspec{' + family + '}'
+        else:
+            family_cmd = ''
+
+        # --- Schriftgröße (unkalkuliert, ohne globalscale) ---
+        size_raw = props.get('font-size', '')
+        pt = None
+        if size_raw:
+            num_m = re.match(r'([\d.]+)\s*(px|pt|em|%)?', size_raw)
+            if num_m:
+                val  = float(num_m.group(1))
+                unit = (num_m.group(2) or 'px').lower()
+                if unit == 'px':   pt = val * PX_TO_PT
+                elif unit == 'pt': pt = val
+                elif unit == 'em': pt = val * 10.0
+                elif unit == '%':  pt = val / 100.0 * 10.0
+                else:              pt = val * PX_TO_PT
+
+        # --- Schriftstärke ---
+        weight_raw = props.get('font-weight', 'normal').lower()
+        weight_cmd = r'\bfseries' if weight_raw in ('bold', '700', '800', '900') else ''
+
+        # --- Schriftschnitt ---
+        style_raw = props.get('font-style', 'normal').lower()
+        shape_cmd = r'\itshape' if style_raw in ('italic', 'oblique') else ''
+
+        return {'family_cmd': family_cmd, 'pt': pt,
+                'weight_cmd': weight_cmd, 'shape_cmd': shape_cmd}
+
+    def _get_ancestor_scale(el):
+        """Berechnet den kumulativen Skalierungsfaktor aller SVG-transform-Attribute
+        auf Vorfahren-Elementen. svg2tikz übersetzt diese in cm={...}-Scopes, die
+        Koordinaten skalieren aber nicht \fontsize – daher müssen wir den Faktor
+        in die Punktgröße einrechnen."""
+        import math
+        scale = 1.0
+        parent = el.getparent()
+        while parent is not None:
+            t = parent.get('transform', '')
+            m = re.match(r'matrix\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)', t)
+            if m:
+                a, b = float(m.group(1)), float(m.group(2))
+                scale *= math.sqrt(a*a + b*b)
+            else:
+                m2 = re.match(r'scale\s*\(\s*(-?[\d.]+)', t)
+                if m2:
+                    scale *= float(m2.group(1))
+            parent = parent.getparent()
+        return scale
+
+    # font_map: { element_id: components_dict }
+    # Gebaut nur für <text>-Elemente mit class="s2t-keep-font".
+    # Alle anderen Nodes erhalten keine font={}-Injektion und verwenden
+    # die Schriftart und -größe des LaTeX-Dokuments.
+    font_map      = {}
+    keep_font_ids = set()
+    align_map     = {}   # { element_id: 'left'|'center'|'right' } — nur aus text-anchor
+
+    for el in root.iter(f'{{{ns}}}text'):
+        el_id = el.get('id', '')
+        anchor = el.get(_TIKZ_ANCHOR_ATTR, '')
+        if el_id and anchor:
+            anchor_map[el_id] = anchor
+
+        if not el_id:
+            continue
+
+        # align aus text-anchor ableiten — UNABHÄNGIG von tikz:anchor
+        style = el.get('style', '')
+        ta = 'start'
+        for decl in style.split(';'):
+            if ':' in decl:
+                p, _, v = decl.partition(':')
+                if p.strip() == 'text-anchor':
+                    ta = v.strip()
+        if ta == 'middle':
+            align_map[el_id] = 'center'
+        elif ta == 'end':
+            align_map[el_id] = 'right'
+        else:
+            align_map[el_id] = 'left'
+
+        if 's2t-keep-font' not in set(el.get('class', '').split()):
+            continue
+
+        components = _svg_style_to_tikz_font(el.get('style', ''))
+        if components.get('pt') is None:
+            continue
+
+        anc_scale = _get_ancestor_scale(el)
+        components['pt'] *= anc_scale
+        font_map[el_id] = components
+        keep_font_ids.add(el_id)
+
+    # beamer:overlay-Sentinels in <g>-Elemente injizieren.
+    #
+    # svg2tikz erzeugt für <g>-Elemente keinen benannten Node, sondern einen
+    # \begin{scope}...\end{scope}-Block – ohne die ursprüngliche Element-ID.
+    # Damit fix_latex_output trotzdem weiß, wo der \uncover-Block beginnt und
+    # endet, injizieren wir zwei spezielle leere <text>-Sentinel-Elemente:
+    # einen am Anfang und einen am Ende jedes <g> mit beamer:overlay.
+    # svg2tikz erzeugt daraus leere \node-Befehle mit den Sentinel-IDs, die
+    # fix_latex_output durch \uncover<spec>{ bzw. } ersetzt.
+    _BEAMER_OPEN_PREFIX  = 's2tBeamerOpen'
+    _BEAMER_CLOSE_PREFIX = 's2tBeamerClose'
+    if beamer_overlay_map:
+        from lxml import etree as _et
+        for el in list(root.iter(f'{{{ns}}}g')):
+            el_id = el.get('id', '')
+            if el_id not in beamer_overlay_map:
+                continue
+            # Position für den ersten echten Content-Child bestimmen
+            children = list(el)
+            if not children:
+                continue
+            # Öffnungs-Sentinel vor dem ersten Kind einfügen
+            open_id  = f'{_BEAMER_OPEN_PREFIX}{el_id}'
+            close_id = f'{_BEAMER_CLOSE_PREFIX}{el_id}'
+            # Koordinaten vom ersten Kind übernehmen (damit svg2tikz
+            # einen sinnvollen at-Punkt hat)
+            ref = children[0]
+            ref_x = ref.get('x', '0')
+            ref_y = ref.get('y', '0')
+            def _make_sentinel(sid, x, y):
+                t = _et.SubElement(el, f'{{{ns}}}text')
+                t.set('id', sid)
+                t.set('x', x)
+                t.set('y', y)
+                t.set('style', 'font-size:0.001px;fill:none;stroke:none')
+                t.text = ''
+                return t
+            open_node  = _make_sentinel(open_id,  ref_x, ref_y)
+            close_node = _make_sentinel(close_id, ref_x, ref_y)
+            # open_node VOR erstem Kind positionieren (remove + insert)
+            el.remove(open_node)
+            el.insert(0, open_node)
+            # close_node bleibt am Ende (SubElement hängt ans Ende)
+
+    # Mehrzeilige <text>-Elemente: Mehrere <tspan> mit explizit unterschiedlichen y-Werten
+    # erzeugen in svg2tikz einen einzigen \node mit allem auf einer Zeile. Wir fassen
+    # den Inhalt hier zu einem einzigen tspan zusammen, getrennt durch den Zeilenumbruch-
+    # Marker _NEWLINE_MARKER, den fix_latex_output später zu \\ + align=center umschreibt.
+    _NEWLINE_MARKER = '⏎'
+    for text_el in root.iter(f'{{{ns}}}text'):
+        # Nur direkte tspan-Kinder betrachten (keine verschachtelten)
+        direct_tspans = [t for t in text_el if t.tag == f'{{{ns}}}tspan']
+        if len(direct_tspans) < 2:
+            continue
+        # Prüfen ob alle tspans explizite y-Werte haben, die sich unterscheiden
+        ys = []
+        for t in direct_tspans:
+            y = t.get('y')
+            if y is None:
+                break
+            try:
+                ys.append(float(y))
+            except ValueError:
+                break
+        else:
+            if len(set(ys)) < 2:
+                continue  # Alle y-Werte gleich → kein Zeilenumbruch nötig
+            # Tspans nach y-Wert sortieren (aufsteigend = von oben nach unten)
+            sorted_pairs = sorted(zip(ys, direct_tspans), key=lambda p: p[0])
+            # Texte zusammensammeln
+            lines = []
+            for _, t in sorted_pairs:
+                txt = (t.text or '').strip()
+                if txt:
+                    lines.append(txt)
+            if len(lines) < 2:
+                continue
+            combined = _NEWLINE_MARKER.join(lines)
+            # Ersten tspan mit dem zusammengefassten Text befüllen
+            first = sorted_pairs[0][1]
+            first.text = combined
+            # Übrige tspans leeren (werden von svg2tikz ignoriert wenn text=None)
+            for _, t in sorted_pairs[1:]:
+                t.text = None
+                t.tail = None
+
+    # Text-fill von <tspan>-Kindern auf <text>-Eltern hochreichen.
+    # svg2tikz liest die Füllfarbe vom <text>-Element, ignoriert aber ein
+    # abweichendes fill auf dem <tspan>. Wenn alle tspan-Kinder (sofern welche
+    # vorhanden sind) dieselbe explizite fill-Farbe haben, die sich vom fill
+    # des <text> unterscheidet, schreiben wir diese Farbe auf das <text>.
+    for text_el in root.iter(f'{{{ns}}}text'):
+        tspans = [t for t in text_el.iter(f'{{{ns}}}tspan') if t.text and t.text.strip()]
+        if not tspans:
+            continue
+        tspan_fills = []
+        for t in tspans:
+            f = get_style_prop(t, 'fill')
+            if f is None:
+                # Mindestens ein tspan hat kein eigenes fill → kein sicheres Hochreichen
+                tspan_fills = None
+                break
+            tspan_fills.append(f.strip())
+        if not tspan_fills:
+            continue
+        if len(set(tspan_fills)) != 1:
+            # Unterschiedliche fills in verschiedenen tspans – nicht automatisch lösbar
+            continue
+        new_fill = tspan_fills[0]
+        text_fill = (get_style_prop(text_el, 'fill') or '').strip()
+        if text_fill.lower() == new_fill.lower():
+            continue
+        # fill auf dem <text> ersetzen (oder anhängen, falls keins existiert)
+        style = text_el.get('style', '')
+        if re.search(r'(^|;)\s*fill\s*:', style):
+            style = re.sub(r'(^|;)\s*fill\s*:[^;]*',
+                           lambda m: m.group(1) + 'fill:' + new_fill, style)
+        else:
+            style = (style.rstrip(';') + ';fill:' + new_fill).lstrip(';')
+        text_el.set('style', style)
+
+    # Text-Stroke als Marker-Attribut speichern.
+    # svg2tikz ignoriert stroke auf <text>-Elementen. Damit dennoch z.B. eine
+    # weiße Outline erzeugt werden kann (stroke:#ffffff;stroke-width:...) speichern
+    # wir Farbe und Breite als data-Attribute, die fix_latex_output später in eine
+    # doppelte \node-Ausgabe (erst Strich, dann Füllung) umwandelt.
+    _STROKE_COLOR_ATTR = 'data-tikz-stroke-color'
+    _STROKE_WIDTH_ATTR = 'data-tikz-stroke-width'
+    for text_el in root.iter(f'{{{ns}}}text'):
+        sc = get_style_prop(text_el, 'stroke')
+        sw = get_style_prop(text_el, 'stroke-width')
+        so = get_style_prop(text_el, 'stroke-opacity')
+        if sc and sc != 'none' and sw:
+            # Farbe in rgb() konvertieren damit svg2tikz ein \definecolor erzeugt
+            sc_rgb = hex_to_rgb_style(f'fill:{sc}').replace('fill:', '')
+            # Effektive Deckkraft berücksichtigen
+            try:
+                opacity = float(so) if so else 1.0
+            except ValueError:
+                opacity = 1.0
+            if opacity > 0.01:
+                text_el.set(_STROKE_COLOR_ATTR, sc_rgb)
+                text_el.set(_STROKE_WIDTH_ATTR, sw)
+                el_id = text_el.get('id', '')
+                if el_id:
+                    stroke_map[el_id] = (sc_rgb, sw)
+
+    # Inkscape-Powerclip-Cutouts auflösen.
+    #
+    # Inkscape speichert einen "inverse" Powerclip als <clipPath> mit einem
+    # Kind-<path class="powerclip"> dessen d-Attribut aus äußerer Hüllform
+    # (ein größeres Rechteck als das geklippte Element, gedacht als
+    # "unendliche" Ebene) + innerer Aussparungsform(en) besteht. Visuell
+    # soll dabei das geklippte Element außerhalb seiner eigenen Geometrie
+    # unsichtbar bleiben.
+    #
+    # svg2tikz ignoriert clip-path-Referenzen komplett. Wir delegieren die
+    # Auflösung an Inkscape: für jedes geklippte Element fügen wir die
+    # Lochgeometrie als separaten Pfad ein und rufen Inkscape mit
+    # `path-difference` auf. Inkscape berechnet exakt die Bool'sche
+    # Differenz Außenform \\ Loch und schreibt sie als neues d-Attribut
+    # zurück – mit erhaltenen Bezier-/Arc-Segmenten, ohne
+    # Clip-Path-Attribut, ohne even-odd-Überhang. Der resultierende SVG
+    # geht danach ganz regulär durch svg2tikz.
+    #
+    # Ohne installiertes Inkscape fällt die Auflösung aus; das geklippte
+    # Element bleibt dann wie in der Eingabe bestehen (mit clip-path-
+    # Referenz, die svg2tikz ignoriert) – schlechter als ein echter
+    # Cutout, aber nie falsch.
+
+    powerclip_holes = {}   # clipPath-id -> d nur mit den Löchern (ohne Hülle)
+    for cp in root.iter(f'{{{ns}}}clipPath'):
+        cp_id = cp.get('id', '')
+        if not cp_id:
+            continue
+        for p in cp.iter(f'{{{ns}}}path'):
+            if p.get('class') == 'powerclip' and p.get('d'):
+                full_d = p.get('d')
+                # Subpfade splitten und Absolutkoordinaten auflösen.
+                # Subpfad[0] ist die Powerclip-Hülle (das „unendliche"
+                # Außen-Rechteck), alle weiteren sind die eigentlichen
+                # Lochformen. Wir verwerfen die Hülle und behalten nur
+                # die Löcher.
+                subpaths = _split_powerclip_subpaths(full_d)
+                if len(subpaths) >= 2:
+                    holes_d = ' '.join(
+                        f'M {ax:.6f},{ay:.6f} {rest}'
+                        for ax, ay, rest in subpaths[1:]
+                    )
+                    powerclip_holes[cp_id] = holes_d
+                break
+
+    def _rect_to_d(el):
+        """Erzeugt ein d-Attribut für ein <rect>-Element ohne vorhandenes d,
+        aus x/y/width/height. Rundungsecken werden berücksichtigt, falls
+        rx/ry gesetzt sind."""
+        try:
+            x = float(el.get('x', '0'))
+            y = float(el.get('y', '0'))
+            w = float(el.get('width', '0'))
+            h = float(el.get('height', '0'))
+            rx = float(el.get('rx', '0') or '0')
+            ry = float(el.get('ry', '0') or '0')
+        except ValueError:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        if rx <= 0 and ry <= 0:
+            return f'M {x},{y} h {w} v {h} h {-w} z'
+        # Runde Ecken: rx/ry auf Hälfte von w/h begrenzen
+        if rx <= 0: rx = ry
+        if ry <= 0: ry = rx
+        rx = min(rx, w / 2)
+        ry = min(ry, h / 2)
+        return (f'M {x+rx},{y} '
+                f'h {w-2*rx} '
+                f'a {rx},{ry} 0 0 1 {rx},{ry} '
+                f'v {h-2*ry} '
+                f'a {rx},{ry} 0 0 1 {-rx},{ry} '
+                f'h {-(w-2*rx)} '
+                f'a {rx},{ry} 0 0 1 {-rx},{-ry} '
+                f'v {-(h-2*ry)} '
+                f'a {rx},{ry} 0 0 1 {rx},{-ry} z')
+
+    # Alle powerclippten Elemente sammeln, bevor wir Inkscape aufrufen.
+    # Jedes bekommt eine eindeutige ID und wir merken uns das zugehörige
+    # Loch, damit wir nachher alle Differenzen in einem einzigen
+    # Inkscape-Aufruf abarbeiten können.
+    powerclip_jobs = []   # Liste von (target_id, hole_id) für Inkscape-Aufruf
+    job_counter = [0]
+
+    if powerclip_holes:
+        for el in list(root.iter()):
+            clip = el.get('clip-path', '')
+            m = re.match(r'url\(#([^)]+)\)', clip)
+            if not m:
+                continue
+            cp_id = m.group(1)
+            if cp_id not in powerclip_holes:
+                continue
+
+            # Original-d ermitteln (rect → d konvertieren falls nötig)
+            local = etree.QName(el).localname
+            orig_d = el.get('d')
+            if not orig_d and local == 'rect':
+                orig_d = _rect_to_d(el)
+            if not orig_d:
+                continue
+
+            # rect → path umtaggen und Geometrie-Attribute entfernen,
+            # damit Inkscape beim Neu-Einlesen das modifizierte d sieht
+            # und nicht die alten rect-Attribute.
+            for attr in ('width', 'height', 'x', 'y', 'rx', 'ry',
+                         'cx', 'cy', 'r',
+                         'x1', 'y1', 'x2', 'y2',
+                         'points',
+                         '{http://www.inkscape.org/namespaces/inkscape}path-effect',
+                         '{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}type'):
+                el.attrib.pop(attr, None)
+            if local != 'path':
+                el.tag = f'{{{ns}}}path'
+            el.set('d', orig_d)
+
+            # Zielpfad braucht eine stabile ID für Inkscape
+            target_id = el.get('id')
+            if not target_id:
+                target_id = f's2t_powerclip_target_{job_counter[0]}'
+                el.set('id', target_id)
+
+            # clip-path-Attribut wird nicht mehr benötigt
+            del el.attrib['clip-path']
+
+            # Lochpfad als Geschwister direkt nach el einfügen. Er wird
+            # nachher von Inkscape für path-difference konsumiert und
+            # verschwindet dabei automatisch.
+            parent = el.getparent()
+            if parent is None:
+                continue
+            hole_id = f's2t_powerclip_hole_{job_counter[0]}'
+            hole = etree.SubElement(parent, f'{{{ns}}}path')
+            hole.set('id', hole_id)
+            hole.set('d', powerclip_holes[cp_id])
+            # Hole sichtbar machen mit derselben Größe wie Ziel, damit
+            # Inkscape eine korrekte Bounding-Box hat (Fill wird von der
+            # Differenz-Operation ohnehin entfernt).
+            hole.set('style', 'fill:#000000;fill-opacity:1')
+            # Hole muss NACH el in der Dokumenten-Reihenfolge kommen,
+            # damit Inkscape's path-difference die richtige Richtung
+            # liefert (oberstes Objekt ist der Subtrahend).
+            parent.remove(hole)
+            idx = list(parent).index(el)
+            parent.insert(idx + 1, hole)
+
+            powerclip_jobs.append((target_id, hole_id))
+            job_counter[0] += 1
+
+    # Wenn es Jobs gibt: Inkscape aufrufen, um die Bool'schen Differenzen
+    # zu berechnen. Das modifiziert den SVG-Tree über einen Temp-File-
+    # Round-Trip.
+    if powerclip_jobs:
+        tree, root = _apply_inkscape_path_differences(tree, root, powerclip_jobs, ns)
+
+    # Hex-Farben in style-Attributen aller Elemente in rgb(...) umwandeln,
+    # damit svg2tikz keine falschen benannten xcolor-Namen vergibt.
+    # (apply_css_to_element hat das bereits für text/tspan erledigt; hier
+    # werden alle übrigen Elemente – path, rect, circle, ... – abgedeckt.)
+    for el in root.iter():
+        style = el.get("style", "")
+        if style and "#" in style:
+            el.set("style", hex_to_rgb_style(style))
+
+    # data-tikz-anchor-user aus dem SVG entfernen bevor svg2tikz es verarbeitet
+    for el in root.iter():
+        el.attrib.pop('data-tikz-anchor-user', None)
+
+    svg_string = etree.tostring(tree, encoding="unicode")
+    return svg_string, width_px, height_px, default_anchor, anchor_map, beamer_overlay_map, stroke_map, font_map, keep_font_ids, align_map
+
+
+def compute_globalscale(width_px, textwidth_mm, height_px=None, textheight_mm=None):
+    r"""
+    Berechnet \globalscale so dass die Tikz-Ausgabe in textwidth_mm (Breite) und
+    optional textheight_mm (Höhe) passt. Wenn beide angegeben sind, wird der
+    kleinere Skalierungsfaktor verwendet (Bild passt in beide Schranken).
+    Nie größer als 1 (nicht vergrößern).
+    """
+    PX_PER_CM = 37.795275591
+    scale = 1.0
+
+    if width_px and width_px > 0 and textwidth_mm:
+        tikz_width_cm = width_px / PX_PER_CM
+        desired_cm    = textwidth_mm / 10.0
+        scale = min(scale, desired_cm / tikz_width_cm)
+
+    if height_px and height_px > 0 and textheight_mm:
+        tikz_height_cm = height_px / PX_PER_CM
+        desired_cm     = textheight_mm / 10.0
+        scale = min(scale, desired_cm / tikz_height_cm)
+
+    return min(scale, 1.0)   # nie vergrößern
+
+
+def scale_coordinates(text, scale):
+    """Multipliziert alle Koordinatenpaare (x, y) sowie line width-Angaben
+    im tikz-Code mit scale."""
+    def scale_pair(m):
+        x = float(m.group(1)) * scale
+        y = float(m.group(2)) * scale
+        return '({:.4f}, {:.4f})'.format(x, y)
+    text = re.sub(r'\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)', scale_pair, text)
+
+    def scale_linewidth(m):
+        val = float(m.group(1)) * scale
+        unit = m.group(2)
+        return 'line width={:.6g}{}'.format(val, unit)
+    text = re.sub(r'line width=([\d.]+)(cm|pt)', scale_linewidth, text)
+
+    return text
+
+
+def fix_linewidths_in_cm_scopes(text):
+    r"""Korrigiert line width-Werte innerhalb von \begin{scope}[cm={...}]-Blöcken.
+
+    svg2tikz ignoriert beim Umrechnen von SVG stroke-width die matrix()-Transformation
+    des umgebenden <g>-Elements. Das führt dazu, dass Strichbreiten innerhalb eines
+    skalierten Scopes viel zu groß ausgegeben werden.
+
+    Diese Funktion liest den Skalierungsfaktor aus jedem cm={a,b,c,d,...}-Scope
+    (= sqrt(a²+b²)) und multipliziert alle line width-Werte im Scope-Inhalt damit.
+
+    Verschachtelte Scopes werden korrekt behandelt: die Skalierung ist kumulativ.
+    """
+    import math
+
+    # Wir arbeiten zeilenweise und verwalten einen Scope-Stack.
+    # Jeder Eintrag im Stack ist der kumulative Skalierungsfaktor bis zu diesem Scope.
+    lines  = text.splitlines(keepends=True)
+    result = []
+    # Stack von kumulativen Skalierungsfaktoren; 1.0 = globale Ebene (kein Scope)
+    scale_stack = [1.0]
+
+    scope_open  = re.compile(r'\\begin\{scope\}\[([^\]]*)\]')
+    scope_close = re.compile(r'\\end\{scope\}')
+    cm_pattern  = re.compile(
+        r'cm\s*=\s*\{\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)'
+    )
+    lw_pattern  = re.compile(r'line width=([\d.]+)(cm|pt)')
+
+    for line in lines:
+        # Scope öffnen?
+        open_m = scope_open.search(line)
+        if open_m:
+            opts = open_m.group(1)
+            cm_m = cm_pattern.search(opts)
+            if cm_m:
+                a, b = float(cm_m.group(1)), float(cm_m.group(2))
+                scope_scale = math.sqrt(a*a + b*b)
+            else:
+                scope_scale = 1.0
+            # Kumulativer Faktor: äußerer Scope × dieser Scope
+            scale_stack.append(scale_stack[-1] * scope_scale)
+            result.append(line)
+            continue
+
+        # Scope schließen?
+        if scope_close.search(line):
+            if len(scale_stack) > 1:
+                scale_stack.pop()
+            result.append(line)
+            continue
+
+        # Innerhalb eines skalierten Scopes: line width korrigieren
+        current_scale = scale_stack[-1]
+        if current_scale != 1.0 and 'line width=' in line:
+            def fix_lw(m, s=current_scale):
+                val  = float(m.group(1)) * s
+                unit = m.group(2)
+                return 'line width={:.6g}{}'.format(val, unit)
+            line = lw_pattern.sub(fix_lw, line)
+
+        result.append(line)
+
+    return ''.join(result)
+
+
+# SVG/CSS named colors that differ from TikZ/xcolor's definition.
+# Maps the TikZ color name svg2tikz would emit -> (R, G, B) from the SVG/CSS spec.
+_SVG_COLOR_FIXES = {
+    # The single most common offender: CSS 'green' = #008000, TikZ 'green' = #00ff00
+    'green':   (0,   128, 0),
+    # These are fine in TikZ but listed for completeness; add more as needed.
+    # 'lime':  (0, 255, 0),   # TikZ has no 'lime' by default anyway
+}
+
+
+def fix_colors_in_latex(text):
+    r"""
+    Replaces named TikZ color references that differ from their SVG/CSS equivalents
+    with \definecolor + a unique name, so the rendered color matches the SVG source.
+
+    For every affected color name (e.g. 'green') this function:
+      1. Inserts a \definecolor{svgGreen}{RGB}{0,128,0} before \begin{tikzpicture}
+      2. Replaces every occurrence of =green (draw=green, fill=green, color=green)
+         with the new name.
+    """
+    for tikz_name, (r, g, b) in _SVG_COLOR_FIXES.items():
+        # Check whether the color is actually used
+        pattern_used = re.compile(
+            r'(?:draw|fill|color|text)\s*=\s*' + re.escape(tikz_name) + r'\b'
+            r'|\\color\{' + re.escape(tikz_name) + r'\}'
+        )
+        if not pattern_used.search(text):
+            continue
+
+        # Build a safe new name, e.g. green -> svgGreen
+        new_name = 'svg' + tikz_name[0].upper() + tikz_name[1:]
+        define = r'\definecolor{{{}}}'.format(new_name) + \
+                 r'{{RGB}}{{{},{},{}}}'.format(r, g, b)
+
+        # Insert \definecolor right before \begin{tikzpicture}
+        text = text.replace(
+            r'\begin{tikzpicture}',
+            define + '\n' + r'\begin{tikzpicture}',
+            1
+        )
+
+        # Replace =colorname with =newname
+        # Covers: draw=, fill=, color=, text=  (TikZ node text color)
+        text = re.sub(
+            r'((?:draw|fill|color|text)\s*=\s*)' + re.escape(tikz_name) + r'\b',
+            r'\g<1>' + new_name,
+            text
+        )
+
+        # Also replace standalone \color{name} commands inside nodes
+        text = re.sub(
+            r'(\\color\{)' + re.escape(tikz_name) + r'(\})',
+            r'\g<1>' + new_name + r'\2',
+            text
+        )
+
+    return text
+
+
+def replace_node_anchor_by_id(m, anchor_map, default_anchor, align_map=None):
+    """Hilfsfunktion: Ersetzt anchor=... und align=... in einem einzelnen \\node-Befehl.
+    anchor= wird aus anchor_map (inkl. tikz:anchor-Override) gesetzt.
+    align= wird aus align_map (nur text-anchor, unabhängig von tikz:anchor) gesetzt."""
+    opts      = m.group(1)
+    node_name = m.group(2)
+    rest      = m.group(3)
+
+    chosen_anchor = default_anchor
+    if node_name in anchor_map:
+        chosen_anchor = anchor_map[node_name]
+    else:
+        for svg_id, tikz_anchor in anchor_map.items():
+            if node_name.endswith(svg_id) or svg_id.endswith(node_name):
+                chosen_anchor = tikz_anchor
+                break
+
+    if chosen_anchor:
+        opts = re.sub(r'\banchor=[\w ]+', f'anchor={chosen_anchor}', opts)
+
+    # align= aus align_map (text-anchor), NICHT aus chosen_anchor
+    if align_map:
+        chosen_align = None
+        if node_name in align_map:
+            chosen_align = align_map[node_name]
+        else:
+            for svg_id, al in align_map.items():
+                if node_name.endswith(svg_id) or svg_id.endswith(node_name):
+                    chosen_align = al
+                    break
+        if chosen_align:
+            if 'align' in opts:
+                opts = re.sub(r'\balign\s*=\s*\w+', f'align={chosen_align}', opts)
+            else:
+                opts = opts.rstrip().rstrip(',') + f', align={chosen_align}'
+
+    return r'\node[' + opts + '] (' + node_name + ')' + rest
+
+
+def wrap_powerclip_paths(text):
+    """Obsolet-geworden: die Powerclip-Auflösung geschieht jetzt bereits in
+    `process_svg` per Inkscape-`path-difference`, so dass svg2tikz einen
+    ganz normalen Pfad mit eingebettetem Loch zu sehen bekommt. Diese
+    Funktion bleibt als No-op erhalten, damit ältere Aufrufstellen in
+    `fix_latex_output` unverändert weiterfunktionieren.
+    """
+    return text
+
+
+
+_NEWLINE_MARKER = '⏎'   # muss mit dem in process_svg übereinstimmen
+
+
+def _add_transform_shape_to_rotation_scopes(text):
+    r"""Fügt `transform shape` zu \begin{scope}[cm={...}]-Blöcken hinzu, deren
+    cm-Matrix eine reine Rotation (ggf. mit Translation) darstellt.
+
+    svg2tikz übersetzt SVG-rotate-Transformationen in TikZ-cm-Matrizen. Innerhalb
+    eines solchen Scope werden Koordinaten korrekt rotiert, aber \node-Text bleibt
+    standardmäßig horizontal. Mit `transform shape` rotiert TikZ auch den Text, was
+    dem SVG-Verhalten entspricht.
+
+    Erkennungskriterium einer Rotationsmatrix (ohne Skalierung/Scherung):
+        [a  b]  mit  a²+b²=1  und  d=a, c=-b  (orthonormal, det=1)
+    """
+    def replace_scope(m):
+        opts = m.group(1)  # Inhalt der eckigen Klammern
+        # cm-Werte extrahieren: cm={ a, b, c, d, (tx, ty) }
+        cm_m = re.search(
+            r'cm\s*=\s*\{\s*'
+            r'(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)',
+            opts
+        )
+        if not cm_m:
+            return m.group(0)
+        a, b, c, d = (float(cm_m.group(i)) for i in range(1, 5))
+        # Rotationstest: a²+b²≈1 und d≈a, c≈-b
+        tol = 1e-3
+        if (abs(a*a + b*b - 1.0) < tol and
+                abs(a - d) < tol and
+                abs(b + c) < tol):
+            if 'transform shape' not in opts:
+                opts = opts.rstrip() + ', transform shape'
+        return r'\begin{scope}[' + opts + ']'
+
+    return re.sub(r'\\begin\{scope\}\[([^\]]*)\]', replace_scope, text)
+
+
+def _fix_newline_nodes(text):
+    r"""Ersetzt ⏎-Marker in \node-Inhalten durch TikZ-Zeilenumbrüche (\\).
+    Fügt align=left als Fallback hinzu falls noch kein align= gesetzt ist
+    (normalerweise bereits durch replace_node_anchor_by_id gesetzt)."""
+    _NL = _NEWLINE_MARKER
+
+    def replace_node(m):
+        full = m.group(0)
+        if _NL not in full:
+            return full
+        opts = m.group(1)
+        rest = m.group(2)
+
+        if 'align' not in opts:
+            opts = opts.rstrip().rstrip(',') + ', align=left'
+
+        rest = rest.replace(_NL, r'\\')
+        return r'\node[' + opts + ']' + rest
+
+    return re.sub(
+        r'\\node\[([^\]]*)\](.*?)(?=\s*;)',
+        replace_node,
+        text,
+        flags=re.DOTALL
+    )
+
+
+def _apply_text_strokes(text, stroke_map):
+    r"""Dupliziert \node-Befehle für Text-Elemente mit SVG-stroke, um einen
+    Outline-Effekt zu erzeugen.
+
+    SVG erlaubt stroke auf Text-Elementen (z.B. weiße Outline um schwarzen Text).
+    TikZ-Nodes haben kein direktes Text-Stroke. Wir emulieren es, indem wir den
+    Node 4-mal leicht versetzt in der Strichfarbe vor dem eigentlichen Node ausgeben.
+    Der Versatz beträgt die halbe Strichbreite; bei typischen Outline-Stärken
+    (< 1pt) ist das visuell kaum von einem echten Stroke zu unterscheiden.
+
+    stroke_map: { node_id: (color_str, width_str) }
+        color_str  – TikZ-kompatible Farbe, z.B. "rgb(255,255,255)"
+        width_str  – Strichbreite in SVG-Einheiten (px), z.B. "0.758574"
+    """
+    if not stroke_map:
+        return text
+
+    # Konvertierungsfaktor SVG-px → TikZ-cm (37.795 px/cm)
+    PX_PER_CM = 37.795275591
+
+    # Schritt 1: \definecolor-Definitionen sammeln und vor \begin{tikzpicture} einfügen
+    color_defs = []
+    color_name_map = {}  # node_id → color_name
+
+    # Mapping von SAFE_HEX → bekannte TikZ-Farbnamen (keine \definecolor nötig)
+    _HEX_TO_TIKZ = {
+        '#000000': 'black', '#ffffff': 'white',
+        '#ff0000': 'red',   '#00ff00': 'svgGreen',
+        '#0000ff': 'blue',  '#ffff00': 'yellow',
+        '#00ffff': 'cyan',  '#ff00ff': 'magenta',
+    }
+
+    for node_id, (stroke_color, _) in stroke_map.items():
+        safe_id = re.sub(r'[^A-Za-z0-9]', '', node_id)
+        # Bekannte TikZ-Farbe direkt verwenden
+        if stroke_color.lower() in _HEX_TO_TIKZ:
+            color_name = _HEX_TO_TIKZ[stroke_color.lower()]
+        else:
+            color_name = f'strokeHalo{safe_id}'
+            rgb_m = re.match(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', stroke_color)
+            if rgb_m:
+                r, g, b = rgb_m.groups()
+                color_defs.append(fr'\definecolor{{{color_name}}}{{RGB}}{{{r},{g},{b}}}')
+            else:
+                color_name = stroke_color  # letzter Fallback
+        color_name_map[node_id] = color_name
+
+    if color_defs:
+        text = text.replace(
+            r'\begin{tikzpicture}',
+            '\n'.join(color_defs) + '\n' + r'\begin{tikzpicture}',
+            1
+        )
+
+    # Schritt 2: Pro betroffenem Node Halo-Copies einfügen
+    lines = text.splitlines(keepends=True)
+    result = []
+
+    for line in lines:
+        handled = False
+        for node_id, (stroke_color, stroke_width_svg) in stroke_map.items():
+            if r'\node[' not in line:
+                break
+            if not (re.search(r'\(\s*' + re.escape(node_id) + r'\s*\)', line) or
+                    re.search(r'\([^)]*' + re.escape(node_id) + r'[^)]*\)', line)):
+                continue
+
+            color_name = color_name_map.get(node_id, stroke_color)
+
+            try:
+                sw_px = float(re.sub(r'[^0-9.]', '', stroke_width_svg))
+            except (ValueError, TypeError):
+                sw_px = 0.5
+            half_sw_cm = (sw_px / PX_PER_CM) / 2.0
+
+            stripped = line.rstrip('\n\r')
+            eol = line[len(stripped):]
+            indent = len(stripped) - len(stripped.lstrip())
+            ind = ' ' * indent
+
+            def make_halo(dx_cm, dy_cm, idx, _stripped=stripped, _ind=ind,
+                          _eol=eol, _color=color_name, _id=node_id):
+                shifted = re.sub(
+                    r'at\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)',
+                    lambda m: (f'at ({float(m.group(1)) + dx_cm:.6f},'
+                               f' {float(m.group(2)) + dy_cm:.6f})'),
+                    _stripped
+                )
+                shifted = re.sub(r'\btext\s*=\s*[^,\]]+', f'text={_color}', shifted)
+                shifted = re.sub(
+                    r'\(\s*' + re.escape(_id) + r'\s*\)',
+                    f'(halo{re.sub(chr(91)+chr(93)+r"[^A-Za-z0-9]","",_id)}{idx})',
+                    shifted
+                )
+                body = shifted.rstrip().rstrip(';')
+                return _ind + body.lstrip() + ';' + _eol
+
+            h = half_sw_cm
+            for idx, (dx, dy) in enumerate([(0, h), (0, -h), (-h, 0), (h, 0)]):
+                result.append(make_halo(dx, dy, idx))
+
+            result.append(line)
+            handled = True
+            break
+
+        if not handled:
+            result.append(line)
+
+    return ''.join(result)
+
+
+def _apply_beamer_overlays(text, beamer_overlay_map):
+    r"""Wraps TikZ-Inhalte mit \uncover<spec>{...} für beamer:overlay-Elemente.
+
+    Zwei Mechanismen:
+    1. Gruppen (<g>): process_svg injiziert Sentinel-Text-Nodes am Anfang/Ende
+       der Gruppe. Wir suchen diese Sentinels im TikZ-Output und ersetzen
+       den Bereich dazwischen durch \uncover<spec>{...}.
+    2. Direkte Nodes (<text>, <rect> etc.): Wir suchen den \node-Befehl nach
+       der Element-ID und wrappen ihn.
+    """
+    if not beamer_overlay_map:
+        return text
+
+    _OPEN  = 's2tBeamerOpen'
+    _CLOSE = 's2tBeamerClose'
+
+    # Schritt 1: Sentinel-basiertes Wrapping für Gruppen
+    for el_id, overlay_spec in beamer_overlay_map.items():
+        open_id  = _OPEN  + el_id
+        close_id = _CLOSE + el_id
+
+        # Sentinel-Nodes sehen so aus (leer, evtl. mit coordinate):
+        #   \node[coordinate,...] (s2tBeamerOpeng39) at (...) {};
+        open_pat  = re.compile(
+            r'[ \t]*\\node\[[^\]]*\]\s*\(' + re.escape(open_id)  + r'\)[^;]*;\n?')
+        close_pat = re.compile(
+            r'[ \t]*\\node\[[^\]]*\]\s*\(' + re.escape(close_id) + r'\)[^;]*;\n?')
+
+        open_m  = open_pat.search(text)
+        close_m = close_pat.search(text)
+
+        if open_m and close_m and open_m.start() < close_m.start():
+            # Indentation des öffnenden Sentinels übernehmen
+            indent = len(open_m.group(0)) - len(open_m.group(0).lstrip())
+            ind = ' ' * indent
+
+            # Inhalt zwischen den Sentinels (ohne Sentinels selbst)
+            inner = text[open_m.end():close_m.start()]
+
+            text = (text[:open_m.start()] +
+                    ind + r'\uncover' + overlay_spec + '{%' + '\n' +
+                    inner +
+                    ind + '}% end uncover ' + overlay_spec + '\n' +
+                    text[close_m.end():])
+
+    # Schritt 2: Direktes Node-Wrapping für Text/Pfad-Elemente ohne Sentinel
+    # (nur für IDs die KEIN Sentinel bekommen haben, d.h. nicht in einem <g>)
+    # sentinel_ids müssen VOR Schritt 1 bestimmt werden – nach Schritt 1 sind
+    # die Sentinels bereits aus text entfernt. Wir leiten sie stattdessen aus
+    # dem beamer_overlay_map selbst ab: eine ID hatte Sentinels wenn und nur wenn
+    # Schritt 1 einen Treffer gefunden und den Block gewrappt hat. Als Heuristik:
+    # Eine ID gilt als "per Sentinel behandelt", wenn in beamer_overlay_map ein
+    # Eintrag existiert, für den Schritt 1 _OPEN+id oder _CLOSE+id im URSPRUNGS-
+    # text gefunden hat. Da wir den Originaltext nicht mehr haben, merken wir uns
+    # alle IDs bei denen Schritt 1 erfolgreich war (match open+close vorhanden war).
+    # Einfacher: wir prüfen jetzt ob die ID NOCH im text vorkommt (nach Schritt 1);
+    # wenn die Sentinels entfernt wurden, sind die group-IDs verschwunden.
+    # Stattdessen: Nur exakt-matchende Node-IDs in Schritt 2 wrappen (kein Suffix).
+    lines = text.splitlines(keepends=True)
+    result = []
+    for line in lines:
+        wrapped = False
+        for el_id, overlay_spec in beamer_overlay_map.items():
+            # Nur exakter Node-Name-Match, kein Suffix-Match
+            # (verhindert, dass Gruppen-IDs wie "g39" Nodes wie "text39" matchen)
+            if not re.search(r'\(\s*' + re.escape(el_id) + r'\s*\)', line):
+                continue
+            stripped = line.rstrip('\n\r')
+            eol = line[len(stripped):]
+            indent = len(stripped) - len(stripped.lstrip())
+            ind = ' ' * indent
+            lstripped = stripped.lstrip()
+            if lstripped.endswith(';'):
+                # Semikolon muss INNERHALB der \uncover-Klammern stehen
+                inner = lstripped[:-1]
+                result.append(ind + r'\uncover' + overlay_spec +
+                               '{' + inner + ';}' + eol)
+            else:
+                result.append(ind + r'\uncover' + overlay_spec +
+                               '{' + lstripped + '}' + eol)
+            wrapped = True
+            break
+        if not wrapped:
+            result.append(line)
+    return ''.join(result)
+
+
+def fix_latex_output(text, globalscale, default_anchor=None, anchor_map=None,
+                     beamer_overlay_map=None, convert_beamer_overlay=True,
+                     stroke_map=None, font_map=None, keep_font_ids=None,
+                     textwidth_mm=None, textheight_mm=None, align_map=None):
+    r"""Post-processing pipeline for the raw TikZ output from svg2tikz.
+
+    Applied in order:
+    1.  fix_linewidths_in_cm_scopes  — stroke widths inside cm={} scopes are
+                                       wrong because svg2tikz ignores the
+                                       enclosing matrix() transform.
+    2.  Globalscale refinement       — recomputes the actual scale factor from
+                                       the TikZ absolute coordinate range
+                                       (shift-scope-aware) rather than from
+                                       SVG width/height attributes.
+    3.  scale_coordinates            — multiplies all literal (x,y) pairs and
+                                       line widths by globalscale, replacing
+                                       svg2tikz's xscale/yscale approach which
+                                       would also scale text nodes.
+    4.  anchor + align correction    — fixes TikZ anchor= and align= on each
+                                       \node based on the SVG element's
+                                       text-anchor / dominant-baseline style
+                                       (or tikz:anchor override).
+    5.  font injection               — for class="s2t-keep-font" nodes:
+                                       \fontspec + \fontsize from SVG style.
+    6.  every node scale removal     — removes svg2tikz's scale=\globalscale
+                                       from the default node style.
+    7.  ł-passthrough                — nodes whose text starts with ł are
+                                       treated as raw LaTeX (undoes escaping).
+    8.  wrap_math                    — wraps nodes with subscripts/upright
+                                       markers in \(...\) math mode.
+    9.  Upright markers → \mathrm    — resolves ⟦...⟧ markers.
+    10. Empty nodes → coordinate     — prevents bounding-box contribution from
+                                       invisible empty nodes.
+    11. fix_colors_in_latex          — corrects CSS/SVG colour names that differ
+                                       from TikZ/xcolor (e.g. green).
+    12. transform shape on rotations — text in rotated scopes follows rotation.
+    13. Newline markers → \\         — multiline text support.
+    14. Text stroke → halo nodes     — emulates SVG text stroke via duplicated
+                                       offset nodes.
+    15. beamer overlay → \uncover    — wraps elements with \uncover<spec>{...}.
+    """
+
+    # Powerclip-Cutouts in clip-Scopes einpacken (siehe process_svg).
+    text = wrap_powerclip_paths(text)
+
+    # svg2tikz ignoriert beim Umrechnen von stroke-width die matrix()-Transformation
+    # des umgebenden <g>-Elements → line width-Werte in cm={...}-Scopes sind zu groß.
+    text = fix_linewidths_in_cm_scopes(text)
+
+    # Entferne von svg2tikz emittiertes \def\globalscale
+    text = re.sub(r'\\def\s*\\globalscale\s*\{[^}]*\}\s*\n?', '', text)
+
+    # Globalscale aus dem tatsächlichen TikZ-Koordinatenbereich neu berechnen.
+    # Die SVG-Attributgröße stimmt nicht mit dem TikZ-Koordinatenbereich überein,
+    # weil svg2tikz den y-Flip pro Scope unterschiedlich berechnet, was den
+    # scheinbaren Bereich gegenüber der SVG-Höhe vergrößert.
+    # Wir messen den Bereich aus dem rohen svg2tikz-Output (vor scale_coordinates).
+    # Nur Nodes die NICHT in cm={...}-Scopes liegen werden berücksichtigt,
+    # da cm-Scope-Koordinaten in lokalen (nicht absoluten) Einheiten sind.
+    if textwidth_mm or textheight_mm:
+        # Tatsächliche absolute Ausdehnung berechnen, indem shift-Scope-Transformationen
+        # auf Node-Koordinaten angewendet werden.
+        # cm={...}-Scopes werden übersprungen (lokale Koordinaten, nicht absolut).
+        _lines     = text.splitlines()
+        _abs_xs, _abs_ys = [], []
+        _shift_stack = [(0.0, 0.0)]   # kumulativer Shift-Vektor
+        _cm_depth    = 0
+        _cm_scope_re  = re.compile(r'\\begin\{scope\}\[[^\]]*cm\s*=')
+        _sh_scope_re  = re.compile(r'\\begin\{scope\}\[[^\]]*shift\s*=\s*\{\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)')
+        _scope_close  = re.compile(r'\\end\{scope\}')
+        _at_re        = re.compile(r'\\node\b.*?\bat\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)')
+        _path_re      = re.compile(r'(?:--|\.\.|rectangle)\s*\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)')
+
+        for _line in _lines:
+            if _cm_scope_re.search(_line):
+                _cm_depth += 1
+                _shift_stack.append(_shift_stack[-1])  # cm-scope: shift unverändert
+            elif _scope_close.search(_line):
+                if _shift_stack: _shift_stack.pop()
+                if _cm_depth > 0: _cm_depth -= 1
+            elif r'\begin{scope}' in _line:
+                _sh_m = _sh_scope_re.search(_line)
+                if _sh_m:
+                    _dx, _dy = float(_sh_m.group(1)), float(_sh_m.group(2))
+                    _sx, _sy = _shift_stack[-1]
+                    _shift_stack.append((_sx + _dx, _sy + _dy))
+                else:
+                    _shift_stack.append(_shift_stack[-1])
+            elif _cm_depth == 0:
+                # Node-Position in absoluten Koordinaten
+                _at_m = _at_re.search(_line)
+                if _at_m:
+                    _sx, _sy = _shift_stack[-1]
+                    _abs_xs.append(_sx + float(_at_m.group(1)))
+                    _abs_ys.append(_sy + float(_at_m.group(2)))
+                # Pfad-Endpunkte (außerhalb cm-scope)
+                for _pm in _path_re.finditer(_line):
+                    _sx, _sy = _shift_stack[-1]
+                    _abs_xs.append(_sx + float(_pm.group(1)))
+                    _abs_ys.append(_sy + float(_pm.group(2)))
+
+        if _abs_xs and _abs_ys:
+            _raw_w = max(_abs_xs) - min(_abs_xs)
+            _raw_h = max(_abs_ys) - min(_abs_ys)
+            _gs_w = (textwidth_mm  / 10.0) / _raw_w if (_raw_w > 0 and textwidth_mm)  else 1.0
+            _gs_h = (textheight_mm / 10.0) / _raw_h if (_raw_h > 0 and textheight_mm) else 1.0
+            globalscale = min(_gs_w, _gs_h)
+
+    # Skaliere Koordinaten direkt statt xscale/yscale zu verwenden.
+    # -> Text wird nicht mitskaliert.
+    if globalscale != 1.0:
+        text = scale_coordinates(text, globalscale)
+
+    # globalscale immer auf 1 setzen.
+    # Guard: nicht doppelt einfügen.
+    _baseline_opt = 'baseline=(current bounding box.north),'
+    if _baseline_opt in text:
+        # Bereits vorhanden (aus früherem Lauf) – entfernen
+        text = text.replace(_baseline_opt, '')
+    if r'\def\globalscale{1}' not in text:
+        text = text.replace(
+            r'\begin{tikzpicture}[',
+            r'\def\globalscale{1}' + '\n' + r'\begin{tikzpicture}[',
+            1
+        )
+
+    # Anker-Korrektur: svg2tikz übersetzt text-anchor/dominant-baseline falsch.
+    #
+    # Strategie 1: Per-Node-Korrektur anhand der SVG-Element-IDs.
+    # svg2tikz erzeugt Node-Namen wie (textXXXX) wobei XXXX (oder ein Teil davon)
+    # der SVG-id entspricht.
+    if anchor_map:
+        text = re.sub(
+            r'\\node\[([^\]]*)\]\s*\(([^)]+)\)(.*?)(?=\s*;)',
+            lambda m: replace_node_anchor_by_id(m, anchor_map, default_anchor, align_map),
+            text,
+            flags=re.DOTALL
+        )
+    elif default_anchor:
+        # Strategie 2 (Fallback): Globaler Ersatz aller anchor=... Werte
+        text = re.sub(
+            r'\banchor=[\w ]+',
+            f'anchor={default_anchor}',
+            text
+        )
+
+    # Font-Injektion für alle Text-Nodes mit bekannter SVG-Schriftgröße.
+    #
+    # Für ALLE Nodes: \fontsize{Xpt}{Ypt}\selectfont  (mit globalscale skaliert),
+    # damit Textgröße und Geometrie auch bei globalscale != 1 übereinstimmen.
+    #
+    # Zusätzlich für class="s2t-keep-font"-Nodes: \fontspec{Name} vorangestellt,
+    # damit die exakte SVG-Schriftart verwendet wird (erfordert fontspec/LuaLaTeX).
+    if font_map:
+        def _build_font_spec(components):
+            parts = []
+            if components.get('family_cmd'):   # nur bei s2t-keep-font gesetzt
+                parts.append(components['family_cmd'])
+            pt = components.get('pt')
+            if pt is not None:
+                scaled_pt = pt * globalscale
+                leading   = scaled_pt * 1.2
+                parts.append(r'\fontsize{' + f'{scaled_pt:.4g}' + r'pt}{'
+                             + f'{leading:.4g}' + r'pt}\selectfont')
+            if components.get('weight_cmd'):
+                parts.append(components['weight_cmd'])
+            if components.get('shape_cmd'):
+                parts.append(components['shape_cmd'])
+            return ''.join(parts)
+
+        def add_font_spec(m):
+            opts    = m.group(1)
+            node_id = m.group(2)
+            rest    = m.group(3)
+
+            # Bereits verarbeitet: font= enthält schon \fontspec → überspringen
+            if r'\fontspec' in opts:
+                return m.group(0)
+
+            components = None
+            if node_id in font_map:
+                components = font_map[node_id]
+            else:
+                for svg_id, comp in font_map.items():
+                    if node_id.endswith(svg_id) or svg_id.endswith(node_id):
+                        components = comp
+                        break
+
+            if components is None:
+                return m.group(0)
+
+            font_spec  = _build_font_spec(components)
+            if not font_spec:
+                return m.group(0)
+            font_value = '{' + font_spec + '}'
+            if re.search(r'\bfont\s*=', opts):
+                opts = re.sub(r'\bfont\s*=\s*\{[^}]*\}',
+                              lambda _: 'font=' + font_value, opts)
+            else:
+                opts = opts.rstrip().rstrip(',') + ',font=' + font_value
+            return r'\node[' + opts + '] (' + node_id + ')' + rest
+
+        text = re.sub(
+            r'\\node\[([^\]]*)\]\s*\(([^)]+)\)(.*?)(?=\s*;)',
+            add_font_spec,
+            text,
+            flags=re.DOTALL
+        )
+
+
+    for unicode_sub, latex_sub in LATEX_SUBSCRIPT_MAP.items():
+        text = text.replace(unicode_sub, latex_sub)
+
+    # ⎵X Marker -> _X
+    text = text.replace('⎵', '_')
+
+    # Remove any leftover tail-markers (e.g. when no combine_subscripts ran)
+    text = text.replace(_TAIL_MARKER, '')
+
+    # Math-Mode um Nodes mit Subscripts oder Upright-Markern wrappen.
+    # WICHTIG: Upright-Marker ⟦...⟧ werden erst NACH wrap_math aufgelöst,
+    # damit wrap_math den gesamten Node-Inhalt korrekt in \(...\) einwickeln kann.
+    def wrap_math(match):
+        node_content = match.group(0)
+        needs_math = ('_' in node_content or _UPRIGHT_START in node_content)
+        if not needs_math:
+            return node_content
+        if r'\(' in node_content:
+            return node_content
+
+        # Nur den Inhalt der letzten geschweiften Klammer (Node-Text) bearbeiten
+        # Pattern: letztes {...} vor dem Semikolon
+        text_pattern = r'\{([^{}]+)\}(?=\s*;)'
+
+        def add_math(m):
+            content = m.group(1)
+
+            has_sub     = '_' in content
+            has_upright = _UPRIGHT_START in content
+            if not has_sub and not has_upright:
+                return m.group(0)
+            if content.startswith('$') or content.startswith(r'\('):
+                return m.group(0)
+            # Subscript-Muster oder Upright-Marker müssen vorhanden sein.
+            # Wenn Upright-Marker vorhanden sind, immer wrappen – ⟦...⟧ wird zu
+            # \mathrm{...} aufgelöst, was zwingend Math-Mode erfordert.
+            if has_sub and not has_upright and not re.search(r'[A-Za-z]\s*_', content):
+                return m.group(0)
+
+            # Schritt 0a: Upright-Marker die direkt subscript-Inhalt einschließen
+            # (beginnen mit _) und unmittelbar nach einem Buchstaben stehen,
+            # in plain subscripts umwandeln: letter ⟦_x_y⟧ -> letter_x_y
+            # Solche Blöcke entstehen, wenn ein tspan sowohl baseline-shift:sub
+            # als auch font-style:normal hat. Die Upright-Markierung ist für
+            # Ziffern/Punkte im Subscript überflüssig.
+            content = re.sub(
+                r'([A-Za-z])\s*' + re.escape(_UPRIGHT_START) +
+                r'(_[^' + re.escape(_UPRIGHT_END) + r']*)' + re.escape(_UPRIGHT_END),
+                lambda mo: mo.group(1) + mo.group(2),
+                content
+            )
+
+            # Schritt 0b: Upright-Block der mit einem Buchstaben endet, gefolgt
+            # von einem Subscript-in-Upright-Block: ⟦...X⟧ ⟦_x_y⟧ -> ⟦...X⟧_x_y
+            # Der Subscript hängt am letzten Buchstaben des Upright-Blocks.
+            content = re.sub(
+                re.escape(_UPRIGHT_START) + r'([^' + re.escape(_UPRIGHT_END) + r']*)([A-Za-z])' + re.escape(_UPRIGHT_END) +
+                r'\s*' + re.escape(_UPRIGHT_START) + r'(_[^' + re.escape(_UPRIGHT_END) + r']*)' + re.escape(_UPRIGHT_END),
+                lambda mo: _UPRIGHT_START + mo.group(1) + mo.group(2) + _UPRIGHT_END + mo.group(3),
+                content
+            )
+
+            # Schritt 1: Leerzeichen direkt vor _ entfernen
+            content = re.sub(r'\s+_', '_', content)
+
+            # Schritt 2: "Buchstabe Leerzeichen Buchstabe_..." -> "Buchstabe_Buchstabe_..."
+            content = re.sub(r'([A-Za-z])\s+([A-Za-z]+_)', r'\1_\2', content)
+
+            # Schritt 3: Aufeinanderfolgende _x zu _{mathrm{...}} kombinieren.
+            # Der Upright-Marker beendet den Subscript-Bereich (wie _TAIL_MARKER).
+            # Sonderfall: ⟦...⟧_x_y  (Subscript hängt an einem Upright-Block).
+            def combine_subscripts(ms):
+                full = ms.group(0)
+                # Sonderfall: Match beginnt mit Upright-Block ⟦...⟧_...
+                if full.startswith(_UPRIGHT_START):
+                    close = full.index(_UPRIGHT_END)
+                    upright_block = full[:close + 1]
+                    sub_rest = full[close + 1:]          # beginnt mit _...
+                    sub_content = sub_rest.replace('_', '').replace(_TAIL_MARKER, '')
+                    return upright_block + r'_{{\mathrm{{{}}}}}'.format(sub_content)
+                # Normalfall: letter_x_y...
+                idx = full.find('_')
+                base = full[:idx]
+                rest = full[idx:].replace('_', '')
+                # Upright-Marker beendet den Subscript-Teil
+                if _UPRIGHT_START in rest:
+                    sub_part, tail_part = rest.split(_UPRIGHT_START, 1)
+                    tail_part = _UPRIGHT_START + tail_part
+                elif _TAIL_MARKER in rest:
+                    sub_part, tail_part = rest.split(_TAIL_MARKER, 1)
+                else:
+                    sub_part, tail_part = rest, ''
+                result = base + r'_{{\mathrm{{{}}}}}'.format(sub_part)
+                if tail_part:
+                    result += tail_part
+                return result
+
+            # Matcht: "letter_x_y" oder "⟦...⟧_x_y"
+            _us = re.escape(_UPRIGHT_START)
+            _ue = re.escape(_UPRIGHT_END)
+            content = re.sub(
+                r'(?:' + _us + r'[^' + _ue + r']*' + _ue + r'|[A-Za-z]+)_[^,\s{}' + _us + _ue + r']+',
+                combine_subscripts, content
+            )
+            return r'{\(' + content + r'\)}'
+
+        node_content = re.sub(text_pattern, add_math, node_content)
+        return node_content
+
+    # Entferne scale=\globalscale aus every node style (Text soll nicht skaliert werden)
+    text = re.sub(r',\s*every node/\.append style=\{scale=\\globalscale\}', '', text)
+    text = re.sub(r'every node/\.append style=\{scale=\\globalscale\},?\s*', '', text)
+
+    # ł-Passthrough: Node-Inhalte die mit ł beginnen werden als roher LaTeX-Code
+    # durchgereicht. svg2tikz hat Sonderzeichen escaped (\$ -> \\\$, \ -> $\backslash$,
+    # { -> \{, } -> \}) – das wird hier rückgängig gemacht.
+    # Warnung: Wenn ein Node-Text $ oder \ enthält aber kein ł-Präfix hat, deutet
+    # das auf vergessenes ł hin.
+    _LATEX_PASS_MARKER = 'ł'
+
+    def unescape_svg2tikz(s):
+        """Macht svg2tikz-Escaping von LaTeX-Sonderzeichen rückgängig."""
+        # Reihenfolge wichtig: $\backslash$ vor \{ und \}
+        s = s.replace(r'$\backslash$', '\\')
+        s = s.replace(r'\$', '$')
+        s = s.replace(r'\{', '{')
+        s = s.replace(r'\}', '}')
+        s = s.replace(r'\_', '_')
+        s = s.replace(r'\^', '^')
+        s = s.replace(r'\&', '&')
+        s = s.replace(r'\#', '#')
+        s = s.replace(r'\%', '%')
+        s = s.replace(r'\~', '~')
+        return s
+
+    def process_latex_passthrough(m):
+        full_node = m.group(0)
+        # Letzten top-level {...}-Block (Node-Text) extrahieren.
+        # Wir suchen rückwärts nach dem letzten öffnenden { auf oberster Ebene.
+        depth = 0
+        end = len(full_node)
+        start = None
+        for i in range(len(full_node) - 1, -1, -1):
+            c = full_node[i]
+            if c == '}':
+                depth += 1
+                if depth == 1:
+                    end = i
+            elif c == '{':
+                depth -= 1
+                if depth == 0:
+                    start = i
+                    break
+        if start is None:
+            return full_node
+        raw_content = full_node[start + 1:end]
+        unescaped = unescape_svg2tikz(raw_content)
+        # Prüfen ob ł-Präfix vorhanden
+        if unescaped.startswith(_LATEX_PASS_MARKER):
+            latex_content = unescaped[len(_LATEX_PASS_MARKER):]
+            return full_node[:start] + '{' + latex_content + '}'
+        # Warnung wenn Text wie LaTeX aussieht aber kein ł hat.
+        # TikZ-Zeilenumbrüche (\\) sind kein LaTeX-Code → nur warnen wenn
+        # nach dem Entfernen aller \\\\ noch $ oder \ übrig bleibt.
+        _unescaped_check = re.sub(r'\\\\', '', unescaped)
+        if '$' in _unescaped_check or '\\' in _unescaped_check:
+            name_match = re.search(r'\(([^)]+)\)', full_node)
+            node_name = name_match.group(1) if name_match else '?'
+            print(
+                f"Hinweis: Node ({node_name}) enthält $ oder \\ – sieht aus wie LaTeX,\n"
+                f"  wird aber als normaler Text behandelt. Falls LaTeX gewünscht:\n"
+                f"  ł vor den Text stellen (AltGr+L), z.B.: ł{unescaped}",
+                file=sys.stderr
+            )
+        return full_node
+
+    # Das Regex matcht den gesamten Node bis zum ; damit process_latex_passthrough
+    # den letzten {...}-Block per re.search finden kann. [^;]* erfasst dabei auch
+    # verschachtelte {} im Node-Text (z.B. nach Unescapen: \indextext{GS}).
+    text = re.sub(
+        r'\\node\[[^\]]*\]\s*\([^)]+\)[^;]*(?=;)',
+        process_latex_passthrough,
+        text,
+        flags=re.DOTALL
+    )
+
+    # wrap_math nur innerhalb tikzpicture anwenden
+    def wrap_tikzpicture(m):
+        inner = re.sub(r'\\node\[[^\]]*\][^;]*;', wrap_math, m.group(0))
+        return inner
+
+    text = re.sub(r'\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}',
+                  wrap_tikzpicture, text, flags=re.DOTALL)
+
+    # Upright-Marker ⟦...⟧ -> \mathrm{...} (nach wrap_math, damit \(...\) bereits gesetzt ist)
+    # Außerhalb von Math-Mode (kein Subscript-Node) werden die Marker ebenfalls sauber aufgelöst.
+    text = re.sub(re.escape(_UPRIGHT_START) + r'(.*?)' + re.escape(_UPRIGHT_END),
+                  lambda m: r'\mathrm{' + m.group(1) + '}',
+                  text, flags=re.DOTALL)
+
+    # Mehrfache Leerzeilen entfernen
+    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+    text = re.sub(r'(\\begin\{[^}]+\})\n\s*\n', r'\1\n', text)
+
+    # Leere Nodes (Inhalt = {}) tragen trotzdem zur Bounding Box bei, weil TikZ
+    # ihre Position (inkl. aller Scope-Transformationen) registriert. Das kann
+    # bei svg2tikz-Ausgaben mit großen shift-Transformationen zu massiv überhöhten
+    # Bounding Boxes führen und riesige Lücken zwischen Bild und Caption erzeugen.
+    # Lösung: leeren Nodes den Style 'coordinate' hinzufügen – er unterdrückt
+    # jeglichen BB-Beitrag, ohne die Lesbarkeit des Codes zu beeinträchtigen.
+    def add_coordinate_to_empty_nodes(m):
+        opts     = m.group(1)   # Inhalt der eckigen Klammern
+        node_id  = m.group(2)   # Node-Name
+        rest     = m.group(3)   # "at (...){}" – endet garantiert mit {}
+        # Nur wirklich leere Nodes: rest endet mit {}  (kein Inhalt zwischen {})
+        if not re.search(r'\{\s*\}\s*$', rest):
+            return m.group(0)
+        if 'coordinate' not in opts:
+            opts = 'coordinate,' + opts
+        return r'\node[' + opts + '] (' + node_id + ')' + rest
+
+    text = re.sub(
+        r'\\node\[([^\]]*)\]\s*\(([^)]+)\)(.*?)(?=\s*;)',
+        add_coordinate_to_empty_nodes,
+        text,
+        flags=re.DOTALL
+    )
+
+    # Korrigiere SVG/CSS-Farbnamen die in TikZ anders definiert sind (z.B. green)
+    text = fix_colors_in_latex(text)
+
+    # Rotation-Scopes: transform shape hinzufügen, damit Text mitrotiert wird
+    text = _add_transform_shape_to_rotation_scopes(text)
+
+    # Mehrzeilige Nodes: ⏎-Marker → \\ + align=center
+    text = _fix_newline_nodes(text)
+
+    # Text-Stroke (SVG stroke auf <text>) → Halo-Effekt durch versetzt-duplizierte Nodes
+    if stroke_map:
+        text = _apply_text_strokes(text, stroke_map)
+
+    # beamer:overlay-Attribute → \uncover<overlay>{...}
+    if convert_beamer_overlay and beamer_overlay_map:
+        text = _apply_beamer_overlays(text, beamer_overlay_map)
+
+    return text
+
+
+def generate_output_filename(input_file):
+    base = os.path.splitext(input_file)[0]
+    return base + '.tex'
+
+
+def print_help():
+    print("Verwendung: s2t input.svg [--output output.tex] [--textwidth N] [--textheight N] [--no-beamer-overlay] [svg2tikz Optionen]")
+    print("")
+    print("Wrapper für svg2tikz mit automatischer Vorverarbeitung.")
+    print("Die Eingabedatei darf ohne .svg-Endung angegeben werden;")
+    print("fehlt die Datei, wird automatisch <name>.svg probiert.")
+    print("")
+    print("Optionen:")
+    print("  -h, --help            Diese Hilfe anzeigen und beenden")
+    print("  --output FILE         Ausgabedatei (Standard: input.tex neben der SVG)")
+    print("  --textwidth N         Zielbreite in mm (Standard: 150)")
+    print("  --textheight N        Zielhöhe in mm (optional); der kleinere der beiden")
+    print("                        Skalierungsfaktoren (Breite/Höhe) wird verwendet,")
+    print("                        so dass das Bild in beide Schranken passt.")
+    print("  --no-beamer-overlay   beamer:overlay-Attribute NICHT in \\\\uncover umwandeln.")
+    print("")
+    print("Alle weiteren Argumente werden unverändert an svg2tikz durchgereicht.")
+    print("(--codeoutput=figonly wird intern bereits gesetzt.)")
+    print("")
+    print("Behebt automatisch:")
+    print("  - CSS <style>-Blöcke werden auf text/tspan-Elemente angewendet")
+    print("    (z.B. text-anchor, dominant-baseline, font-size, ...)")
+    print("  - baseline-shift:sub -> LaTeX subscripts")
+    print("  - Berechnet \\globalscale für Zielbreite/-höhe (nie vergrößern)")
+    print("  - Kombiniert mehrfache Subscripts zu _{mathrm{...}}")
+    print("  - Mehrzeilige Texte (tspan mit verschiedenen y) -> \\\\\\\\ + align=center")
+    print("  - Text in rotierten Scopes: transform shape (korrekte Textrotation)")
+    print("  - beamer:overlay-Attribute -> \\\\uncover<spec>{...} (opt-out: --no-beamer-overlay)")
+    print("  - class=\"s2t-keep-font\" auf <text>: \\fontspec{Name}\\fontsize{..}{..}\\selectfont")
+    print("    aus SVG-Style in font={} des TikZ-Nodes (erfordert fontspec / LuaLaTeX)")
+    print("  - Entfernt ueberflussige Leerzeilen")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(1)
+
+    if sys.argv[1] in ('-h', '--help'):
+        print_help()
+        sys.exit(0)
+
+    input_file = None
+    output_file = None
+    textwidth_mm  = 150.0
+    textheight_mm = None
+    convert_beamer_overlay = True
+    other_args = []
+
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in ('-h', '--help'):
+            print_help()
+            sys.exit(0)
+        elif arg == '--output' and i + 1 < len(sys.argv):
+            output_file = sys.argv[i + 1]
+            i += 2
+        elif arg.startswith('--output='):
+            output_file = arg.split('=', 1)[1]
+            i += 1
+        elif arg == '--textwidth' and i + 1 < len(sys.argv):
+            textwidth_mm = float(sys.argv[i + 1])
+            i += 2
+        elif arg.startswith('--textwidth='):
+            textwidth_mm = float(arg.split('=', 1)[1])
+            i += 1
+        elif arg == '--textheight' and i + 1 < len(sys.argv):
+            textheight_mm = float(sys.argv[i + 1])
+            i += 2
+        elif arg.startswith('--textheight='):
+            textheight_mm = float(arg.split('=', 1)[1])
+            i += 1
+        elif arg == '--no-beamer-overlay':
+            convert_beamer_overlay = False
+            i += 1
+        elif not arg.startswith('-') and input_file is None:
+            input_file = arg
+            i += 1
+        else:
+            other_args.append(arg)
+            i += 1
+
+    if not input_file:
+        print("Fehler: Keine Input-SVG-Datei angegeben", file=sys.stderr)
+        sys.exit(1)
+
+    # .svg-Endung automatisch ergänzen, wenn die Datei ohne Endung nicht existiert
+    if not os.path.exists(input_file) and not os.path.splitext(input_file)[1]:
+        candidate = input_file + '.svg'
+        if os.path.exists(candidate):
+            input_file = candidate
+        else:
+            print(f"Fehler: Datei nicht gefunden: {input_file} (auch {candidate} nicht vorhanden)", file=sys.stderr)
+            sys.exit(1)
+
+    if not output_file:
+        output_file = generate_output_filename(input_file)
+
+    # SVG vorverarbeiten
+    processed_svg, width_px, height_px, default_anchor, anchor_map, beamer_overlay_map, stroke_map, font_map, keep_font_ids, align_map = process_svg(input_file)
+    globalscale = compute_globalscale(width_px, textwidth_mm, height_px, textheight_mm)
+
+    if width_px:
+        PX_PER_CM = 37.795275591
+        tikz_w = width_px / PX_PER_CM
+        tikz_h = height_px / PX_PER_CM if height_px else None
+        size_str = f"{width_px:.1f}px = {tikz_w:.2f}cm"
+        if tikz_h:
+            size_str += f"  ×  {height_px:.1f}px = {tikz_h:.2f}cm"
+        target_str = f"{textwidth_mm}mm breit"
+        if textheight_mm:
+            target_str += f" × {textheight_mm}mm hoch"
+        print(f"SVG-Inhaltsgröße: {size_str}  →  globalscale={globalscale:.4f} (Ziel: {target_str})")
+    else:
+        print("Warnung: SVG-Breite konnte nicht ermittelt werden, globalscale=1")
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8') as tmp_svg:
+        tmp_svg_file = tmp_svg.name
+        tmp_svg.write(processed_svg)
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.tex', delete=False) as tmp_tex:
+        tmp_tex_file = tmp_tex.name
+
+    try:
+        cmd = ['svg2tikz', tmp_svg_file, '--output', tmp_tex_file, '--codeoutput=figonly'] + other_args
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode)
+
+        with open(tmp_tex_file, 'r', encoding='utf-8') as f:
+            latex_content = f.read()
+
+        latex_content = fix_latex_output(
+            latex_content, globalscale, default_anchor, anchor_map,
+            beamer_overlay_map=beamer_overlay_map,
+            convert_beamer_overlay=convert_beamer_overlay,
+            stroke_map=stroke_map,
+            font_map=font_map,
+            keep_font_ids=keep_font_ids,
+            textwidth_mm=textwidth_mm,
+            textheight_mm=textheight_mm,
+            align_map=align_map,
+        )
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(latex_content)
+
+        print(f"Konvertierung abgeschlossen: {output_file}")
+
+    finally:
+        for tmp_file in [tmp_svg_file, tmp_tex_file]:
+            if os.path.exists(tmp_file):
+                os.unlink(tmp_file)
+
+
+if __name__ == '__main__':
+    main()
